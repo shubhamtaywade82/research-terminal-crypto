@@ -1,0 +1,117 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Historical OHLCV candles.
+///   kind = "last" -> execution series (real USDT-M perpetual trades)
+///   kind = "mark" -> mark price series (the price Binance liquidates on)
+model Candle {
+  id        Int      @id @default(autoincrement())
+  symbol    String
+  interval  String
+  kind      String   @default("last")
+  openTime  DateTime
+  open      Float
+  high      Float
+  low       Float
+  close     Float
+  volume    Float
+
+  @@unique([symbol, interval, kind, openTime])
+  @@index([symbol, interval, kind])
+}
+
+/// USDT-M perpetual funding rate history (real settled rates from the
+/// Binance public archive; markPrice joined from mark klines at ingest)
+model FundingRate {
+  id          Int      @id @default(autoincrement())
+  symbol      String
+  fundingTime DateTime
+  rate        Float
+  markPrice   Float
+
+  @@unique([symbol, fundingTime])
+  @@index([symbol, fundingTime])
+}
+
+/// One complete experiment: params + dataset range + aggregated metrics
+model BacktestRun {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  label     String
+  symbol    String
+  interval  String
+  dataFrom  DateTime
+  dataTo    DateTime
+  /// JSON-serialized StrategyParams (SQLite has no native JSON type)
+  params    String
+  status    String   @default("COMPLETED")
+  /// JSON-serialized BacktestMetrics
+  metrics   String
+
+  trades       Trade[]
+  equityPoints EquityPoint[]
+  riskEvents   RiskEvent[]
+}
+
+/// Full trade ledger: every position outcome including liquidations and failures
+model Trade {
+  id             Int      @id @default(autoincrement())
+  runId          String
+  run            BacktestRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  seq            Int
+  direction      String
+  openTime       DateTime
+  closeTime      DateTime
+  avgEntry       Float
+  exitPrice      Float
+  qtyTotal       Float
+  marginDeployed Float
+  dcaLayers      Int
+  grossPnl       Float
+  fees           Float
+  funding        Float
+  netPnl         Float
+  roiOnMargin    Float
+  maePct         Float
+  mfePct         Float
+  exitReason     String
+  equityAfter    Float
+  holdMinutes    Float
+
+  @@index([runId])
+}
+
+/// Downsampled mark-to-market equity curve with drawdown
+model EquityPoint {
+  id          Int     @id @default(autoincrement())
+  runId       String
+  run         BacktestRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  t           DateTime
+  equity      Float
+  drawdownPct Float
+  inPosition  Boolean
+  marginRatio Float?
+
+  @@index([runId])
+}
+
+/// Risk lifecycle events: warnings, critical margin, DCA blocks, liquidations
+model RiskEvent {
+  id      Int     @id @default(autoincrement())
+  runId   String
+  run     BacktestRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  t       DateTime
+  type    String
+  message String
+
+  @@index([runId])
+}
