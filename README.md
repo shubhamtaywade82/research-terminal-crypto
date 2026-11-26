@@ -110,9 +110,10 @@ recharts for the equity / drawdown / price charts.
 ## Run it
 
 ```bash
-bun install
-bun run db:push        # create the local SQLite schema
-bun run dev            # http://localhost:3000
+bun install             # regenerates bun.lock
+cp .env.example .env    # local SQLite path (db/custom.db)
+bun run db:push         # create the local SQLite schema
+bun run dev             # http://localhost:3000
 ```
 
 Then in the app: open the **Run** tab → **Fetch Real Binance Data** (1 year × 4 symbols takes
