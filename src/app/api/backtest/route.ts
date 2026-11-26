@@ -81,7 +81,21 @@ interface StoredRun {
   metrics: BacktestMetrics;
 }
 
-/** Run the engine for one param set and persist the full run ledger. */
+/** Rows per bulk insert: keeps each statement well under SQLite's bind-param limit. */
+const INSERT_CHUNK = 500;
+
+function chunked<T>(rows: T[], size = INSERT_CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Run the engine for one param set and persist the full run ledger.
+ * The run row and all child rows are written in ONE transaction: a failed
+ * insert rolls back the whole experiment, so the registry never lists a run
+ * whose trades are missing.
+ */
 async function runAndStore(
   params: StrategyParams,
   candles: Candle[],
@@ -96,72 +110,82 @@ async function runAndStore(
     markCandles.length > 1 ? markCandles : undefined,
   );
 
-  const run = await db.backtestRun.create({
-    data: {
-      label,
-      symbol: params.symbol,
-      interval: params.interval,
-      dataFrom: new Date(result.dataFrom),
-      dataTo: new Date(result.dataTo),
-      params: JSON.stringify(params),
-      status: 'COMPLETED',
-      metrics: JSON.stringify(result.metrics),
-    },
-  });
-
-  if (result.trades.length > 0) {
-    await db.trade.createMany({
-      data: result.trades.map((t) => ({
-        runId: run.id,
-        seq: t.seq,
-        direction: t.direction,
-        openTime: new Date(t.openTime),
-        closeTime: new Date(t.closeTime),
-        avgEntry: t.avgEntry,
-        exitPrice: t.exitPrice,
-        qtyTotal: t.qtyTotal,
-        marginDeployed: t.marginDeployed,
-        dcaLayers: t.dcaLayers,
-        grossPnl: t.grossPnl,
-        fees: t.fees,
-        funding: t.funding,
-        netPnl: t.netPnl,
-        roiOnMargin: t.roiOnMargin,
-        maePct: t.maePct,
-        mfePct: t.mfePct,
-        exitReason: t.exitReason,
-        equityAfter: t.equityAfter,
-        holdMinutes: t.holdMinutes,
-      })),
-    });
-  }
-
   const step = Math.max(1, Math.ceil(result.equityCurve.length / 2500));
-  const points = result.equityCurve
-    .filter((p, idx) => idx % step === 0 || idx === result.equityCurve.length - 1)
-    .map((p) => ({
-      runId: run.id,
-      t: new Date(p.t),
-      equity: Math.round(p.equity * 100) / 100,
-      drawdownPct: Math.round(p.drawdownPct * 100) / 100,
-      inPosition: p.inPosition,
-      marginRatio:
-        p.marginRatio == null ? null : Math.round(p.marginRatio * 1000) / 1000,
-    }));
-  if (points.length > 0) {
-    await db.equityPoint.createMany({ data: points });
-  }
+  const sampledCurve = result.equityCurve.filter(
+    (_p, idx) => idx % step === 0 || idx === result.equityCurve.length - 1,
+  );
 
-  if (result.riskEvents.length > 0) {
-    await db.riskEvent.createMany({
-      data: result.riskEvents.map((e) => ({
-        runId: run.id,
-        t: new Date(e.t),
-        type: e.type,
-        message: e.message,
-      })),
-    });
-  }
+  const run = await db.$transaction(
+    async (tx) => {
+      const created = await tx.backtestRun.create({
+        data: {
+          label,
+          symbol: params.symbol,
+          interval: params.interval,
+          dataFrom: new Date(result.dataFrom),
+          dataTo: new Date(result.dataTo),
+          params: JSON.stringify(params),
+          status: 'COMPLETED',
+          metrics: JSON.stringify(result.metrics),
+        },
+      });
+
+      for (const batch of chunked(result.trades)) {
+        await tx.trade.createMany({
+          data: batch.map((t) => ({
+            runId: created.id,
+            seq: t.seq,
+            direction: t.direction,
+            openTime: new Date(t.openTime),
+            closeTime: new Date(t.closeTime),
+            avgEntry: t.avgEntry,
+            exitPrice: t.exitPrice,
+            qtyTotal: t.qtyTotal,
+            marginDeployed: t.marginDeployed,
+            dcaLayers: t.dcaLayers,
+            grossPnl: t.grossPnl,
+            fees: t.fees,
+            funding: t.funding,
+            netPnl: t.netPnl,
+            roiOnMargin: t.roiOnMargin,
+            maePct: t.maePct,
+            mfePct: t.mfePct,
+            exitReason: t.exitReason,
+            equityAfter: t.equityAfter,
+            holdMinutes: t.holdMinutes,
+          })),
+        });
+      }
+
+      for (const batch of chunked(sampledCurve, 1000)) {
+        await tx.equityPoint.createMany({
+          data: batch.map((p) => ({
+            runId: created.id,
+            t: new Date(p.t),
+            equity: Math.round(p.equity * 100) / 100,
+            drawdownPct: Math.round(p.drawdownPct * 100) / 100,
+            inPosition: p.inPosition,
+            marginRatio:
+              p.marginRatio == null ? null : Math.round(p.marginRatio * 1000) / 1000,
+          })),
+        });
+      }
+
+      for (const batch of chunked(result.riskEvents, 1000)) {
+        await tx.riskEvent.createMany({
+          data: batch.map((e) => ({
+            runId: created.id,
+            t: new Date(e.t),
+            type: e.type,
+            message: e.message,
+          })),
+        });
+      }
+
+      return created;
+    },
+    { timeout: 120_000, maxWait: 10_000 },
+  );
 
   return {
     id: run.id,

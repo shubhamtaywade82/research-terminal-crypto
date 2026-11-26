@@ -22,6 +22,7 @@ import { cn } from '@/lib/utils';
 import { Eye, FlaskConical, Loader2, Play, Trophy } from 'lucide-react';
 import { fmtPct, fmtSignedPct } from '@/lib/format';
 import { CompareRow } from '@/lib/nprs/types';
+import { STRATEGIES } from '@/lib/nprs/strategies';
 
 interface StrategyLabProps {
   rows: CompareRow[] | null;
@@ -99,7 +100,7 @@ export function StrategyLab({
             {loading ? (
               <>
                 <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
-                Running 8 strategies...
+                Running {STRATEGIES.length} strategies...
               </>
             ) : (
               <>

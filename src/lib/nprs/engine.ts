@@ -1,21 +1,24 @@
 // NPRS deterministic event-driven backtest engine.
 //
-// Design rules (spec sections 5/6/12):
-//  - Signal from bar i-1 is executed at bar i open (no lookahead).
-//  - Isolated margin; every tranche sized independently at configured leverage.
-//  - Conservative intrabar ordering: liquidation is checked BEFORE DCA fills;
-//    if both a DCA level and liquidation are touched within one candle the
-//    simulator assumes liquidation happened first.
-//  - Limit fills only when the candle range crosses the limit price; filled at
-//    the limit price with maker fee (no queue modeling).
-//  - When one candle touches both DCA levels and the (post-fill) take-profit,
-//    fills are assumed to happen first (dip-then-rally); combined with the
-//    liquidation-first rule above this is the coherent conservative ordering
-//    for the dangerous cases.
-//  - Take-profit counts only if the favorable extreme crosses the derived
-//    target price; executed with slippage + taker fee (conservative).
-//  - Funding applied from real history (or fixed rate) progressively.
-//  - Position exits only via TP / liquidation / configured rules or end of data.
+// Timing rules (no lookahead):
+//  - A signal evaluated on bar i-1 close is actionable from bar i open. Entries
+//    and trend-flip exits both execute at bar i OPEN (with slippage).
+//  - The entry bar is fully managed: liquidation, DCA fills, take-profit and
+//    risk states are all evaluated on bar i after the entry fill.
+//  - A position can only be opened when flat at the open of the bar, so an
+//    exit never re-enters on the same bar.
+//
+// Intrabar ordering (conservative, documented in the research panel):
+//  - Liquidation is checked on the mark-price extreme BEFORE any DCA fill; if a
+//    candle touches both a DCA level and liquidation, liquidation wins.
+//  - When a candle touches both DCA levels and the (post-fill) take-profit, the
+//    fills are assumed to happen first (dip-then-rally).
+//  - Take-profit fires only when the favorable extreme crosses the target
+//    price; that target is solved so the NET ROI after slippage and the taker
+//    fee equals targetRoiPct, so a TAKE_PROFIT trade realises the target.
+//  - Exits priced at a bar close (MAX_HOLD, EMERGENCY_RISK, END_OF_DATA) are
+//    stamped with that bar's close time, not its open time.
+//  - Funding is accrued progressively from real history (or a fixed rate).
 
 import {
   BacktestResult,
@@ -24,8 +27,10 @@ import {
   EquitySeriesPoint,
   ExitReason,
   FundingEvent,
+  RiskEventRecord,
   RiskEventType,
   StrategyParams,
+  TrendSignal,
   TradeRecord,
 } from './types';
 import { INTERVAL_MS } from './types';
@@ -48,8 +53,8 @@ interface Position {
   cost: number; // sum(qty * price)
   avgEntry: number;
   margin: number;
-  fees: number; // entry fees paid
-  funding: number; // net funding paid
+  fees: number; // entry + DCA fees paid
+  funding: number; // net funding paid (positive = paid)
   liqPrice: number;
   grid: number[]; // planned DCA limit prices
   nextLayer: number; // index of next unfilled layer
@@ -57,6 +62,20 @@ interface Position {
   maePct: number;
   mfePct: number;
   lastState: 'SAFE' | 'WARNING' | 'CRITICAL';
+}
+
+interface CloseOpts {
+  slip: boolean;
+  exitFeeRate: number;
+  forfeitMargin?: boolean;
+}
+
+/** True when `signal` opposes the open position's direction. */
+export function isFlip(direction: Direction, signal: TrendSignal | undefined): boolean {
+  return (
+    (direction === 'LONG' && signal === 'SHORT') ||
+    (direction === 'SHORT' && signal === 'LONG')
+  );
 }
 
 export function runBacktest(
@@ -69,8 +88,9 @@ export function runBacktest(
 
   // Entry signals come from the selected strategy in the registry. Every
   // strategy produces the same TrendSignal[] contract (evaluated on close,
-  // consumed one bar later), so the DCA / risk machinery below is identical
-  // for all signal families - the entry signal stays a controlled variable.
+  // consumed from the next bar open), so the DCA / risk / cost machinery below
+  // is identical for all signal families - the entry signal stays a controlled
+  // variable.
   const strategy = getStrategy(params.strategyId);
   const signals = strategy.computeSignals(candles, params);
   const atr = computeAtr(candles, Math.max(2, Math.round(params.atrPeriod)));
@@ -94,14 +114,16 @@ export function runBacktest(
   const capUsd = params.startingEquity * (params.maxMarginPct / 100);
 
   let wallet = params.startingEquity;
-  let pos: Position | null = null;
+  // `as` keeps TypeScript from narrowing `pos` to `null` at declaration: it is
+  // only assigned inside closures (openPosition / closePosition).
+  let pos = null as Position | null;
   let seq = 0;
   let fi = 0; // funding pointer
   let peakEquity = wallet;
 
   const trades: TradeRecord[] = [];
   const equityCurve: EquitySeriesPoint[] = [];
-  const riskEvents: { t: number; type: RiskEventType; message: string }[] = [];
+  const riskEvents: RiskEventRecord[] = [];
 
   // Event rate limits: keep the risk ledger readable without losing signal.
   let lastWarnEventT = -Infinity;
@@ -114,22 +136,28 @@ export function runBacktest(
     riskEvents.push({ t, type, message });
   };
 
-  // Price at which net ROI on deployed margin reaches the configured target.
+  /**
+   * Price at which NET ROI on deployed margin equals the target. Slippage and
+   * the exit taker fee are applied to the exit price in closePosition(), so the
+   * solved price includes both: the realised TP trade lands on the target.
+   *   LONG : net = qty*P*(1-s)*(1-t) - cost - fees - funding
+   *   SHORT: net = cost - qty*P*(1+s)*(1+t) - fees - funding
+   */
   const targetPrice = (p: Position): number => {
     const targetUsd = (params.targetRoiPct / 100) * p.margin;
     if (p.direction === 'LONG') {
-      const denom = p.qty * (1 - taker);
-      return denom > 0 ? (targetUsd + p.fees + p.funding + p.cost) / denom : NaN;
+      const denom = p.qty * (1 - slip) * (1 - taker);
+      return denom > 0 ? (targetUsd + p.cost + p.fees + p.funding) / denom : NaN;
     }
-    const denom = p.qty * (1 + taker);
+    const denom = p.qty * (1 + slip) * (1 + taker);
     return denom > 0 ? (p.cost - p.fees - p.funding - targetUsd) / denom : NaN;
   };
 
-  const closeAt = (
+  const closePosition = (
     t: number,
     priceRaw: number,
     reason: ExitReason,
-    opts: { slip: boolean; exitFeeRate: number; forfeitMargin?: boolean },
+    opts: CloseOpts,
   ) => {
     if (!pos) return;
     const p = pos;
@@ -149,9 +177,8 @@ export function runBacktest(
     let netPnl: number;
     if (opts.forfeitMargin) {
       // Binance isolated liquidation: the entire position margin is forfeited
-      // to the liquidation engine - nothing returns to the wallet. The gross
-      // capital loss equals the deployed margin (fees/funding already paid).
-      wallet += 0;
+      // to the liquidation engine - nothing returns to the wallet. The wallet
+      // already paid the margin, fees and funding when they were incurred.
       netPnl = -(p.margin + p.fees + p.funding);
     } else {
       const realized = gross - exitFee; // fees/funding already left the wallet
@@ -182,12 +209,16 @@ export function runBacktest(
     });
   };
 
-  const openAt = (i: number, cd: Candle, dir: Direction) => {
+  const openPosition = (i: number, cd: Candle, dir: Direction) => {
     // Entry needs margin + taker fee on the full notional (margin * lev).
     if (wallet < initialMargin0 * (1 + lev * taker)) {
       if (!skipActive) {
         skipActive = true;
-        pushEvent(cd.t, 'ENTRY_SKIPPED', 'Free balance below baseline initial allocation; entries skipped until balance recovers');
+        pushEvent(
+          cd.t,
+          'ENTRY_SKIPPED',
+          'Free balance below baseline initial allocation; entries skipped until balance recovers',
+        );
       }
       return;
     }
@@ -198,6 +229,7 @@ export function runBacktest(
     const fee = qty * price * taker;
     wallet -= margin0 + fee;
 
+    // ATR spacing uses the PREVIOUS bar's ATR (known at this open).
     const spacingAbs =
       params.spacingMode === 'fixed'
         ? price * (params.spacingPct / 100)
@@ -232,14 +264,178 @@ export function runBacktest(
     );
   };
 
+  /** Adverse / favorable excursion vs the CURRENT average entry, from one bar. */
+  const trackExcursion = (p: Position, cd: Candle) => {
+    const worst = p.direction === 'LONG' ? cd.l : cd.h;
+    const best = p.direction === 'LONG' ? cd.h : cd.l;
+    const adv =
+      p.direction === 'LONG'
+        ? ((p.avgEntry - worst) / p.avgEntry) * 100
+        : ((worst - p.avgEntry) / p.avgEntry) * 100;
+    const fav =
+      p.direction === 'LONG'
+        ? ((best - p.avgEntry) / p.avgEntry) * 100
+        : ((p.avgEntry - best) / p.avgEntry) * 100;
+    if (adv > p.maePct) p.maePct = adv;
+    if (fav > p.mfePct) p.mfePct = fav;
+  };
+
+  /** Place DCA limit fills the candle range crosses (dip-then-rally ordering). */
+  const fillDcaLayers = (i: number, cd: Candle, p: Position) => {
+    if (p.gridCancelled || p.nextLayer >= p.grid.length) return;
+    if (isFlip(p.direction, signals[i - 1]) && params.blockDcaOnFlip) {
+      p.gridCancelled = true;
+      pushEvent(
+        cd.t,
+        'DCA_BLOCKED_FLIP',
+        `Trend flipped against ${p.direction} position; remaining DCA orders cancelled (trend health gate)`,
+      );
+      return;
+    }
+    while (p.nextLayer < p.grid.length) {
+      const gp = p.grid[p.nextLayer];
+      const inRange = p.direction === 'LONG' ? gp >= cd.l : gp <= cd.h;
+      if (!inRange) break;
+      let m = layerBase;
+      const allowed = capUsd - p.margin;
+      if (m > allowed) m = allowed;
+      if (wallet * 0.98 < m) m = wallet * 0.98;
+      if (m < layerBase * 0.05 || m <= 0) {
+        p.gridCancelled = true;
+        pushEvent(
+          cd.t,
+          'DCA_CAP',
+          `Deployment cap (${params.maxMarginPct}% of starting equity) reached or balance insufficient; remaining DCA orders cancelled`,
+        );
+        return;
+      }
+      const qty = (m * lev) / gp;
+      const fee = qty * gp * maker;
+      wallet -= m + fee;
+      p.qty += qty;
+      p.cost += qty * gp;
+      p.margin += m;
+      p.fees += fee;
+      p.avgEntry = p.cost / p.qty;
+      p.liqPrice = liquidationPrice(p.avgEntry, lev, mmr, p.direction);
+      p.nextLayer += 1;
+      if (m < layerBase - 1e-9) {
+        p.gridCancelled = true;
+        pushEvent(
+          cd.t,
+          'DCA_CAP',
+          `Final layer scaled to fit ${params.maxMarginPct}% deployment cap; remaining DCA orders cancelled`,
+        );
+        return;
+      }
+    }
+  };
+
+  /**
+   * Intrabar management of an open position on bar i, in the order:
+   * liquidation -> excursion (pre-fill) -> DCA fills -> excursion (post-fill)
+   * -> take-profit -> max hold -> margin risk states.
+   * Every exit branch returns immediately; `p` is closed when it returns.
+   */
+  const managePosition = (i: number, cd: Candle, mk: Candle, p: Position) => {
+    const barClose = cd.t + msPerBar;
+
+    // 1. Liquidation first, on the mark-price extreme.
+    const worstMark = p.direction === 'LONG' ? mk.l : mk.h;
+    const hitLiq =
+      p.direction === 'LONG' ? worstMark <= p.liqPrice : worstMark >= p.liqPrice;
+    trackExcursion(p, cd);
+    if (hitLiq) {
+      const uAtLiq = unrealizedPnl(p.direction, p.qty, p.avgEntry, p.liqPrice);
+      const layers = p.nextLayer;
+      const margin = p.margin;
+      const netLoss = -(p.margin + p.fees + p.funding);
+      closePosition(cd.t, p.liqPrice, 'LIQUIDATION', {
+        slip: false,
+        exitFeeRate: 0,
+        forfeitMargin: true,
+      });
+      pushEvent(
+        cd.t,
+        'LIQUIDATION',
+        `${p.direction} position liquidated at ${p.liqPrice.toPrecision(8)} after ${layers} DCA layer(s); entire deployed margin forfeited (net ${netLoss.toFixed(2)} USDT, margin ${margin.toFixed(2)}, mark-price move at boundary ${uAtLiq.toFixed(2)})`,
+      );
+      return;
+    }
+
+    // 2. DCA limit fills, then re-measure excursion against the new average.
+    fillDcaLayers(i, cd, p);
+    trackExcursion(p, cd);
+
+    // 3. Take-profit on the favorable extreme.
+    const tp = targetPrice(p);
+    const tpHit =
+      Number.isFinite(tp) &&
+      tp > 0 &&
+      (p.direction === 'LONG' ? cd.h >= tp : cd.l <= tp);
+    if (tpHit) {
+      closePosition(cd.t, tp, 'TAKE_PROFIT', { slip: true, exitFeeRate: taker });
+      return;
+    }
+
+    // 4. Maximum holding period (exit priced at bar close).
+    if (
+      params.maxHoldHours > 0 &&
+      cd.t - p.openTime >= params.maxHoldHours * HOUR_MS
+    ) {
+      closePosition(barClose, cd.c, 'MAX_HOLD', { slip: true, exitFeeRate: taker });
+      return;
+    }
+
+    // 5. Margin risk states, evaluated at bar close on mark price.
+    const u = unrealizedPnl(p.direction, p.qty, p.avgEntry, mk.c);
+    const ratio = marginRatioOf(mmr, p.qty, mk.c, p.margin, u);
+    const state = riskStateOf(ratio, params.riskWarningRatio, params.riskCriticalRatio);
+    if (state !== p.lastState) {
+      if (state === 'WARNING' && cd.t - lastWarnEventT > WARN_GAP_MS) {
+        lastWarnEventT = cd.t;
+        pushEvent(
+          cd.t,
+          'WARNING',
+          `Margin ratio ${(ratio * 100).toFixed(1)}% crossed WARNING threshold (${(params.riskWarningRatio * 100).toFixed(0)}%)`,
+        );
+      }
+      if (state === 'CRITICAL' && cd.t - lastCriticalEventT > CRIT_GAP_MS) {
+        lastCriticalEventT = cd.t;
+        pushEvent(
+          cd.t,
+          'CRITICAL',
+          `Margin ratio ${(ratio * 100).toFixed(1)}% breached CRITICAL threshold (${(params.riskCriticalRatio * 100).toFixed(0)}%); pending DCA orders cancelled`,
+        );
+      }
+      p.lastState = state;
+    }
+    // Spec section 5: WARNING blocks further averaging - the remaining DCA grid
+    // is cancelled once the margin ratio first crosses the WARNING threshold
+    // (configurable for A/B research).
+    if (state === 'WARNING' && params.blockDcaOnWarning && !p.gridCancelled) {
+      p.gridCancelled = true;
+      pushEvent(
+        cd.t,
+        'DCA_BLOCKED_WARNING',
+        `Margin ratio ${(ratio * 100).toFixed(1)}% in WARNING zone; remaining DCA orders cancelled (risk gate)`,
+      );
+    }
+    if (state === 'CRITICAL') {
+      p.gridCancelled = true;
+      if (params.forceCloseAtRisk) {
+        closePosition(barClose, cd.c, 'EMERGENCY_RISK', { slip: true, exitFeeRate: taker });
+      }
+    }
+  };
+
   for (let i = 0; i < candles.length; i++) {
     const cd = candles[i];
     const prev = i > 0 ? candles[i - 1] : null;
-    const hadPosAtStart = pos !== null;
     // Mark-price bar for this timestamp (mark drives liquidation + risk marks)
     const mk = markMap ? (markMap.get(cd.t) ?? cd) : cd;
 
-    // --- funding accrual -----------------------------------------------------
+    // --- funding accrual (positions held through the previous bar) ----------
     if (pos && params.fundingMode === 'historical') {
       const from = prev ? prev.t : -1;
       while (fi < funding.length && funding[fi].t <= cd.t) {
@@ -258,176 +454,29 @@ export function runBacktest(
       wallet -= paid;
     }
 
-    // --- position management -------------------------------------------------
-    if (pos && prev) {
-      const p = pos;
-      const best = p.direction === 'LONG' ? cd.h : cd.l;
+    if (prev) {
+      const sigPrev = signals[i - 1];
+      const flatAtOpen = pos === null;
 
-      // 1. Liquidation first: conservative intrabar ordering, evaluated on the
-      //    real mark-price klines (Binance USDT-M liquidates on mark price)
-      const worstMark = p.direction === 'LONG' ? mk.l : mk.h;
-      const hitLiq =
-        p.direction === 'LONG' ? worstMark <= p.liqPrice : worstMark >= p.liqPrice;
-      if (hitLiq) {
-        const uAtLiq = unrealizedPnl(p.direction, p.qty, p.avgEntry, p.liqPrice);
-        closeAt(cd.t, p.liqPrice, 'LIQUIDATION', {
-          slip: false,
-          exitFeeRate: 0,
-          forfeitMargin: true,
-        });
-        pushEvent(
-          cd.t,
-          'LIQUIDATION',
-          `${p.direction} position liquidated at ${p.liqPrice.toPrecision(8)} after ${p.nextLayer} DCA layer(s); entire deployed margin forfeited (net ${(-(p.margin + p.fees + p.funding)).toFixed(2)} USDT, mark-price move at boundary ${uAtLiq.toFixed(2)})`,
-        );
-      } else {
-        // 2. DCA limit fills
-        if (!p.gridCancelled && p.nextLayer < p.grid.length) {
-          const prevSignal = signals[i - 1];
-          const flipped =
-            (p.direction === 'LONG' && prevSignal === 'SHORT') ||
-            (p.direction === 'SHORT' && prevSignal === 'LONG');
-          if (flipped && params.blockDcaOnFlip) {
-            p.gridCancelled = true;
-            pushEvent(
-              cd.t,
-              'DCA_BLOCKED_FLIP',
-              `Trend flipped against ${p.direction} position; remaining DCA orders cancelled (trend health gate)`,
-            );
-          } else {
-            while (p.nextLayer < p.grid.length) {
-              const gp = p.grid[p.nextLayer];
-              const inRange = p.direction === 'LONG' ? gp >= cd.l : gp <= cd.h;
-              if (!inRange) break;
-              let m = layerBase;
-              const allowed = capUsd - p.margin;
-              if (m > allowed) m = allowed;
-              if (wallet * 0.98 < m) m = wallet * 0.98;
-              if (m < layerBase * 0.05 || m <= 0) {
-                p.gridCancelled = true;
-                pushEvent(
-                  cd.t,
-                  'DCA_CAP',
-                  `Deployment cap (${params.maxMarginPct}% of starting equity) reached or balance insufficient; remaining DCA orders cancelled`,
-                );
-                break;
-              }
-              const qty = (m * lev) / gp;
-              const fee = qty * gp * maker;
-              wallet -= m + fee;
-              p.qty += qty;
-              p.cost += qty * gp;
-              p.margin += m;
-              p.fees += fee;
-              p.avgEntry = p.cost / p.qty;
-              p.liqPrice = liquidationPrice(p.avgEntry, lev, mmr, p.direction);
-              p.nextLayer += 1;
-              if (m < layerBase - 1e-9) {
-                p.gridCancelled = true;
-                pushEvent(
-                  cd.t,
-                  'DCA_CAP',
-                  `Final layer scaled to fit ${params.maxMarginPct}% deployment cap; remaining DCA orders cancelled`,
-                );
-                break;
-              }
-            }
-          }
-        }
+      // --- trend-flip exit at bar OPEN (the flip is known at this open) -----
+      if (pos && params.exitOnTrendFlip && isFlip(pos.direction, sigPrev)) {
+        closePosition(cd.t, cd.o, 'TREND_FLIP', { slip: true, exitFeeRate: taker });
+      }
 
-        // 3. Take-profit on favorable extreme (if position survived fills)
-        if (pos) {
-          const tp = targetPrice(p);
-          const tpHit =
-            Number.isFinite(tp) &&
-            tp > 0 &&
-            (p.direction === 'LONG' ? best >= tp : best <= tp);
-          if (tpHit) {
-            closeAt(cd.t, tp, 'TAKE_PROFIT', { slip: true, exitFeeRate: taker });
-          } else {
-            const prevSignal = signals[i - 1];
-            const flipped =
-              (p.direction === 'LONG' && prevSignal === 'SHORT') ||
-              (p.direction === 'SHORT' && prevSignal === 'LONG');
-            if (flipped && params.exitOnTrendFlip) {
-              closeAt(cd.t, cd.c, 'TREND_FLIP', { slip: true, exitFeeRate: taker });
-            } else if (
-              params.maxHoldHours > 0 &&
-              cd.t - p.openTime >= params.maxHoldHours * HOUR_MS
-            ) {
-              closeAt(cd.t, cd.c, 'MAX_HOLD', { slip: true, exitFeeRate: taker });
-            } else {
-              // 4. Margin risk states evaluated at candle close on mark price
-              const u = unrealizedPnl(p.direction, p.qty, p.avgEntry, mk.c);
-              const ratio = marginRatioOf(mmr, p.qty, mk.c, p.margin, u);
-              const state = riskStateOf(
-                ratio,
-                params.riskWarningRatio,
-                params.riskCriticalRatio,
-              );
-              if (state !== p.lastState) {
-                if (state === 'WARNING' && cd.t - lastWarnEventT > WARN_GAP_MS) {
-                  lastWarnEventT = cd.t;
-                  pushEvent(cd.t, 'WARNING', `Margin ratio ${(ratio * 100).toFixed(1)}% crossed WARNING threshold (${(params.riskWarningRatio * 100).toFixed(0)}%)`);
-                }
-                if (state === 'CRITICAL' && cd.t - lastCriticalEventT > CRIT_GAP_MS) {
-                  lastCriticalEventT = cd.t;
-                  pushEvent(cd.t, 'CRITICAL', `Margin ratio ${(ratio * 100).toFixed(1)}% breached CRITICAL threshold (${(params.riskCriticalRatio * 100).toFixed(0)}%); pending DCA orders cancelled`);
-                }
-                p.lastState = state;
-              }
-              // Spec section 5: WARNING blocks further averaging - the remaining
-              // DCA grid is cancelled once the margin ratio first crosses the
-              // WARNING threshold (configurable for A/B research).
-              if (
-                state === 'WARNING' &&
-                params.blockDcaOnWarning &&
-                !p.gridCancelled
-              ) {
-                p.gridCancelled = true;
-                pushEvent(
-                  cd.t,
-                  'DCA_BLOCKED_WARNING',
-                  `Margin ratio ${(ratio * 100).toFixed(1)}% in WARNING zone; remaining DCA orders cancelled (risk gate)`,
-                );
-              }
-              if (state === 'CRITICAL') {
-                if (!p.gridCancelled) p.gridCancelled = true;
-                if (params.forceCloseAtRisk) {
-                  closeAt(cd.t, cd.c, 'EMERGENCY_RISK', { slip: true, exitFeeRate: taker });
-                }
-              }
-            }
-          }
+      // --- entry at bar OPEN, only when flat at the open -------------------
+      if (flatAtOpen) {
+        if (sigPrev === 'LONG' && params.directionMode !== 'short') {
+          openPosition(i, cd, 'LONG');
+        } else if (sigPrev === 'SHORT' && params.directionMode !== 'long') {
+          openPosition(i, cd, 'SHORT');
         }
       }
+
+      // --- intrabar management, including the bar we just entered ---------
+      if (pos) managePosition(i, cd, mk, pos);
     }
 
-    // --- excursion tracking ----------------------------------------------------
-    if (pos) {
-      const p = pos;
-      const worst = p.direction === 'LONG' ? cd.l : cd.h;
-      const best = p.direction === 'LONG' ? cd.h : cd.l;
-      const adv =
-        p.direction === 'LONG'
-          ? ((p.avgEntry - worst) / p.avgEntry) * 100
-          : ((worst - p.avgEntry) / p.avgEntry) * 100;
-      const fav =
-        p.direction === 'LONG'
-          ? ((best - p.avgEntry) / p.avgEntry) * 100
-          : ((p.avgEntry - best) / p.avgEntry) * 100;
-      if (adv > p.maePct) p.maePct = adv;
-      if (fav > p.mfePct) p.mfePct = fav;
-    }
-
-    // --- new entry (only if flat for the entire candle) ------------------------
-    if (!pos && !hadPosAtStart && prev) {
-      const sig = signals[i - 1];
-      if (sig === 'LONG' && params.directionMode !== 'short') openAt(i, cd, 'LONG');
-      else if (sig === 'SHORT' && params.directionMode !== 'long') openAt(i, cd, 'SHORT');
-    }
-
-    // --- equity point (mark-to-market on mark price) --------------------------
+    // --- equity point (mark-to-market on mark price) -------------------------
     let ratio: number | null = null;
     let equity = wallet;
     if (pos) {
@@ -446,13 +495,16 @@ export function runBacktest(
     });
   }
 
-  // Force-close anything still open at the end of the dataset
+  // Force-close anything still open at the end of the dataset.
   if (pos) {
     const last = candles[candles.length - 1];
-    closeAt(last.t, last.c, 'END_OF_DATA', { slip: true, exitFeeRate: taker });
+    closePosition(last.t + msPerBar, last.c, 'END_OF_DATA', {
+      slip: true,
+      exitFeeRate: taker,
+    });
     // The last equity point was recorded before the force-close charged its
-    // exit fee + slippage; sync it so reported finalEquity equals the
-    // realized post-close wallet (metrics read the last curve point).
+    // exit fee + slippage; sync it so reported finalEquity equals the realized
+    // post-close wallet (metrics read the last curve point).
     const lastPoint = equityCurve[equityCurve.length - 1];
     if (lastPoint) {
       lastPoint.equity = wallet;

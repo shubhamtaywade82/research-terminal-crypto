@@ -35,7 +35,10 @@ import { FundingRow, Interval, RawKline } from '@/lib/nprs/types';
 
 const ARCHIVE_HOST = 'https://data.binance.vision';
 const SPOT_API_HOST = 'https://data-api.binance.vision';
-const CACHE_ROOT = path.join(process.cwd(), '.cache', 'binance');
+// Resolved from NPRS_ROOT (set by the start script): the standalone server chdirs
+// into .next/standalone, and `next build` wipes .next, so a cwd-relative cache
+// would be lost on every rebuild.
+const CACHE_ROOT = path.join(process.env.NPRS_ROOT || process.cwd(), '.cache', 'binance');
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
@@ -64,6 +67,17 @@ const INTERVAL_STEP_MS: Record<string, number> = {
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Symbols and intervals are interpolated into archive URLs AND into on-disk
+// cache paths. Validate at the data-source boundary too (not only in the API
+// route), so a value like "../x" can never escape CACHE_ROOT.
+const SYMBOL_RE = /^[A-Z0-9]{2,20}$/;
+function assertArchiveArgs(symbol: string, interval?: string): void {
+  if (!SYMBOL_RE.test(symbol)) throw new Error(`invalid symbol: ${JSON.stringify(symbol)}`);
+  if (interval !== undefined && !(interval in INTERVAL_STEP_MS)) {
+    throw new Error(`unsupported interval: ${JSON.stringify(interval)}`);
+  }
+}
 
 /** Raised when the archive answers 404 (file not published / not listed). */
 class ArchiveNotFound extends Error {
@@ -366,6 +380,7 @@ export async function fetchFuturesKlines(
   kind: 'last' | 'mark' = 'last',
   events?: ArchiveEvents,
 ): Promise<RawKline[]> {
+  assertArchiveArgs(symbol, interval);
   const tasks = klineTasks(symbol, interval, kind, startMs, endMs, Date.now());
   const merged = new Map<number, RawKline>();
 
@@ -375,10 +390,10 @@ export async function fetchFuturesKlines(
       try {
         const { text, cached } = await fetchArchiveCsv(task.archivePath);
         const rows = parseKlinesCsv(text, startMs, endMs, merged);
-        events?.onFile(task.file, cached ? 'cached' : 'downloaded', rows);
+        events?.onFile?.(task.file, cached ? 'cached' : 'downloaded', rows);
       } catch (e) {
         if (e instanceof ArchiveNotFound) {
-          events?.onFile(task.file, 'missing', 0);
+          events?.onFile?.(task.file, 'missing', 0);
           return;
         }
         throw e;
@@ -389,7 +404,8 @@ export async function fetchFuturesKlines(
 
   // --- gap healing -----------------------------------------------------------
   // Monthly zips occasionally miss whole days (observed: BTCUSDT 1h mark
-  // 2026-06-29 absent from the June monthly zip while the daily zip has it).\n  // Detect holes between the first and last bar and patch them from daily
+  // 2026-06-29 absent from the June monthly zip while the daily zip has it).
+  // Detect holes between the first and last bar and patch them from daily
   // files, bounded by MAX_HEAL_DAYS per fetch.
   const stepMs = INTERVAL_STEP_MS[interval];
   if (stepMs) {
@@ -398,7 +414,7 @@ export async function fetchFuturesKlines(
       const family = kind === 'mark' ? 'markPriceKlines' : 'klines';
       const days = Array.from(gapDays).sort((a, b) => a - b).slice(0, MAX_HEAL_DAYS);
       if (gapDays.size > MAX_HEAL_DAYS) {
-        events?.onFile(
+        events?.onFile?.(
           `${gapDays.size} gap days (heal cap ${MAX_HEAL_DAYS})`,
           'missing',
           0,
@@ -414,10 +430,10 @@ export async function fetchFuturesKlines(
             );
             const before = merged.size;
             parseKlinesCsv(text, startMs, endMs, merged);
-            events?.onFile(`${symbol}-${interval}-${ymd}.zip`, 'healed', merged.size - before);
+            events?.onFile?.(`${symbol}-${interval}-${ymd}.zip`, 'healed', merged.size - before);
           } catch (e) {
             if (e instanceof ArchiveNotFound) {
-              events?.onFile(`${symbol}-${interval}-${ymd}.zip`, 'missing', 0);
+              events?.onFile?.(`${symbol}-${interval}-${ymd}.zip`, 'missing', 0);
               return;
             }
             throw e;
@@ -438,6 +454,7 @@ export async function fetchFundingHistory(
   endMs: number,
   events?: ArchiveEvents,
 ): Promise<FundingRow[]> {
+  assertArchiveArgs(symbol);
   const tasks = fundingTasks(symbol, startMs, endMs, Date.now());
   const merged = new Map<number, FundingRow>();
 
@@ -447,10 +464,10 @@ export async function fetchFundingHistory(
       try {
         const { text, cached } = await fetchArchiveCsv(task.archivePath);
         const rows = parseFundingCsv(text, startMs, endMs, merged);
-        events?.onFile(task.file, cached ? 'cached' : 'downloaded', rows);
+        events?.onFile?.(task.file, cached ? 'cached' : 'downloaded', rows);
       } catch (e) {
         if (e instanceof ArchiveNotFound) {
-          events?.onFile(task.file, 'missing', 0);
+          events?.onFile?.(task.file, 'missing', 0);
           return;
         }
         throw e;
@@ -473,14 +490,16 @@ export interface SpotTicker {
   quoteVolumeUsd: number;
 }
 
-let tickerCache: { at: number; data: SpotTicker[] } | null = null;
 const TICKER_TTL_MS = 15_000;
+// Cache per requested symbol set: a single shared slot would return the wrong
+// symbols to a caller that asks for a different list within the TTL.
+const tickerCache = new Map<string, { at: number; data: SpotTicker[] }>();
 
 /** Live 24h statistics from the Binance spot REST API (data-api mirror). */
 export async function fetchSpotTickers(symbols: string[]): Promise<SpotTicker[]> {
-  if (tickerCache && Date.now() - tickerCache.at < TICKER_TTL_MS) {
-    return tickerCache.data;
-  }
+  const key = [...symbols].sort().join(',');
+  const hit = tickerCache.get(key);
+  if (hit && Date.now() - hit.at < TICKER_TTL_MS) return hit.data;
   const q = encodeURIComponent(JSON.stringify(symbols));
   const res = await fetch(`${SPOT_API_HOST}/api/v3/ticker/24hr?symbols=${q}`, {
     signal: AbortSignal.timeout(10_000),
@@ -503,7 +522,7 @@ export async function fetchSpotTickers(symbols: string[]): Promise<SpotTicker[]>
     low: Number(r.lowPrice),
     quoteVolumeUsd: Number(r.quoteVolume),
   }));
-  tickerCache = { at: Date.now(), data };
+  tickerCache.set(key, { at: Date.now(), data });
   return data;
 }
 

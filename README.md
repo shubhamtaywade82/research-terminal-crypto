@@ -61,9 +61,13 @@ multiplier, ...), all validated and clamped server-side.
   equity and `maxDcaLayers`.
 - **Weighted average entry** — `P_avg = Σ(Qi·Pi) / ΣQi`, recomputed per fill; liquidation
   price recomputed from `P_avg`, leverage and maintenance-margin rate.
-- **Take-profit** — net ROI target on deployed margin (`targetRoiPct`), i.e. the exit price
-  that covers entry fees, funding accrued so far and the exit fee. Executed with slippage +
-  taker fee (conservative).
+- **Take-profit** — net ROI target on deployed margin (`targetRoiPct`). The trigger price is
+  solved so that, after exit slippage and the exit taker fee, the trade's net ROI equals the
+  target; a `TAKE_PROFIT` trade therefore realises the configured ROI exactly.
+- **Timing** — a signal evaluated on bar *i−1* close is executed at bar *i* **open** (entries and
+  trend-flip exits alike). The entry bar is fully managed (liquidation, DCA fills, take-profit,
+  risk states), so no candle after the open is skipped. Max-hold, emergency and end-of-data exits
+  are priced at the bar close and stamped with the close time.
 - **Liquidation** — evaluated on the candle's **mark-price** extreme (Binance USDT-M
   liquidates on mark price). Conservative intrabar ordering: liquidation is checked before DCA
   fills; if the candle touches both a DCA level and liquidation, liquidation wins. On
@@ -101,20 +105,49 @@ src/
       metrics.ts              # P(TP<liq), expectancy, drawdown, depth stats, Sharpe/Sortino
       validate.ts             # server-side param sanitization & clamping
       defaults.ts             # baseline config + experiment presets E1–E9
+  lib/db.ts                   # Prisma client on the libsql driver adapter (singleton)
+  lib/db-url.ts               # DATABASE_URL resolution (project-root relative), NPRS_ROOT
   prisma/schema.prisma        # Candle / FundingRate / BacktestRun / Trade / EquityPoint / RiskEvent
+  prisma.config.ts            # Prisma 7 CLI datasource config (migrate / db push)
+  **/__tests__/*.test.ts      # Jest: engine invariants, margin, validation, indicators, archive client
 ```
 
-Stack: Next.js (App Router) + TypeScript, Tailwind + shadcn/ui, Prisma + SQLite,
-recharts for the equity / drawdown / price charts.
+Stack: Next.js (App Router) + React 19 + TypeScript (strict), Tailwind v4 + shadcn-style
+primitives, Prisma 7 + SQLite via `@prisma/adapter-libsql`, recharts 3 for the equity /
+drawdown / price charts, Jest 30 for tests.
 
 ## Run it
 
 ```bash
-bun install             # regenerates bun.lock
-cp .env.example .env    # local SQLite path (db/custom.db)
+bun install             # installs from bun.lock; prisma generate runs on postinstall
+cp .env.example .env    # DATABASE_URL=file:./db/custom.db (relative to the project root)
 bun run db:push         # create the local SQLite schema
 bun run dev             # http://localhost:3000
 ```
+
+Production-style run:
+
+```bash
+bun run build           # next build (standalone) + static/public copy
+bun run start           # sets NPRS_ROOT to the project root, then runs the standalone server
+```
+
+Checks:
+
+```bash
+bun run typecheck       # tsc --noEmit (strict)
+bun run lint            # eslint
+bun run test            # jest: engine invariants, margin, validation, indicators, archive client
+```
+
+Toolchain notes:
+
+- TypeScript is pinned to **6.0.x**: `typescript-eslint` (used by `eslint-config-next`) declares
+  `typescript <6.1.0` and refuses TypeScript 7. Move to 7 once typescript-eslint supports it.
+- Runtime data lives under the project root, never under `.next/`: `db/custom.db` and
+  `.cache/binance/`. `NPRS_ROOT` tells the server where that root is, because the standalone
+  server changes its working directory; `bun run build` wipes `.next/`.
+- Relative `DATABASE_URL` paths resolve from the project root for both the Prisma CLI and the app.
 
 Then in the app: open the **Run** tab → **Fetch Real Binance Data** (1 year × 4 symbols takes
 seconds; 3 years a few minutes; every archive file is cached on disk under `.cache/`) → pick a

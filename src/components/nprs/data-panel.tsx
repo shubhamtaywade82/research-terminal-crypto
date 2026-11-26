@@ -151,7 +151,7 @@ function LiveTickerStrip() {
 
 export function DataPanel({ datasets, job, onIngest }: DataPanelProps) {
   const [symbol, setSymbol] = useState<string>('ALL');
-  const [interval, setInterval] = useState<string>('1h');
+  const [interval, setIntervalChoice] = useState<string>('1h');
   const [years, setYears] = useState<string>('1');
 
   const running = job?.running === true;
@@ -207,7 +207,7 @@ export function DataPanel({ datasets, job, onIngest }: DataPanelProps) {
               <Select
                 value={interval}
                 onValueChange={(v) => {
-                  setInterval(v);
+                  setIntervalChoice(v);
                   // keep the history selection valid for the new interval
                   const maxYears = v === '5m' ? 0.25 : v === '15m' ? 1 : 5;
                   if (Number(years) > maxYears) setYears(String(maxYears));

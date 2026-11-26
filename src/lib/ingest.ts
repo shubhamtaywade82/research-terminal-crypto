@@ -9,6 +9,7 @@
 //
 // Every archive file is cached on disk, so re-ingests only download new files.
 
+import type { Prisma } from '@prisma/client';
 import { db } from '@/lib/db';
 import {
   ArchiveEvents,
@@ -71,40 +72,70 @@ function archiveEvents(job: IngestJobState, kindLabel: string): ArchiveEvents {
   };
 }
 
-async function persistCandles(
+type Tx = Prisma.TransactionClient;
+
+const CHUNK = 1000;
+
+async function insertCandles(
+  tx: Tx,
   symbol: string,
   interval: string,
   kind: 'last' | 'mark',
   candles: Candle[],
 ): Promise<void> {
-  await db.candle.deleteMany({ where: { symbol, interval, kind } });
-  for (let i = 0; i < candles.length; i += 1000) {
-    const chunk = candles.slice(i, i + 1000).map((c) => ({
-      symbol,
-      interval,
-      kind,
-      openTime: new Date(c.t),
-      open: c.o,
-      high: c.h,
-      low: c.l,
-      close: c.c,
-      volume: c.v,
-    }));
-    await db.candle.createMany({ data: chunk });
+  for (let i = 0; i < candles.length; i += CHUNK) {
+    await tx.candle.createMany({
+      data: candles.slice(i, i + CHUNK).map((c) => ({
+        symbol,
+        interval,
+        kind,
+        openTime: new Date(c.t),
+        open: c.o,
+        high: c.h,
+        low: c.l,
+        close: c.c,
+        volume: c.v,
+      })),
+    });
   }
 }
 
-async function persistFunding(symbol: string, funding: FundingEvent[]): Promise<void> {
-  await db.fundingRate.deleteMany({ where: { symbol } });
-  for (let i = 0; i < funding.length; i += 1000) {
-    const chunk = funding.slice(i, i + 1000).map((f) => ({
-      symbol,
-      fundingTime: new Date(f.t),
-      rate: f.rate,
-      markPrice: f.markPrice,
-    }));
-    await db.fundingRate.createMany({ data: chunk });
+async function insertFunding(tx: Tx, symbol: string, funding: FundingEvent[]): Promise<void> {
+  for (let i = 0; i < funding.length; i += CHUNK) {
+    await tx.fundingRate.createMany({
+      data: funding.slice(i, i + CHUNK).map((f) => ({
+        symbol,
+        fundingTime: new Date(f.t),
+        rate: f.rate,
+        markPrice: f.markPrice,
+      })),
+    });
   }
+}
+
+/**
+ * Replace one symbol/interval dataset ATOMICALLY: the old candles (both kinds)
+ * and funding rows are deleted and the fresh ones inserted in one transaction.
+ * A failure anywhere rolls the whole replace back, so the store never holds a
+ * mix of new candles with stale funding (or a half-written series).
+ */
+export async function replaceDataset(
+  symbol: string,
+  interval: string,
+  last: Candle[],
+  mark: Candle[],
+  funding: FundingEvent[],
+): Promise<void> {
+  await db.$transaction(
+    async (tx) => {
+      await tx.candle.deleteMany({ where: { symbol, interval } });
+      await tx.fundingRate.deleteMany({ where: { symbol } });
+      await insertCandles(tx, symbol, interval, 'last', last);
+      await insertCandles(tx, symbol, interval, 'mark', mark);
+      await insertFunding(tx, symbol, funding);
+    },
+    { timeout: 600_000, maxWait: 15_000 },
+  );
 }
 
 /**
@@ -181,11 +212,13 @@ async function runJob(
   for (let si = 0; si < symbols.length; si++) {
     const symbol = symbols[si];
     const base = si / symbols.length;
+    const step = 1 / (3 * symbols.length);
 
-    // One bad symbol (not listed that far back, archive hiccup, ...) must not
-    // abort the remaining symbols - it is logged and skipped instead.
+    // All three series are fetched BEFORE anything is written, so a failure in
+    // any of them leaves the previously stored dataset untouched. One bad symbol
+    // (not listed that far back, archive hiccup, ...) is logged and skipped.
     try {
-      // --- 1. execution klines (real perp OHLCV) -----------------------------
+      // --- 1. execution klines (real perp OHLCV) ---------------------------
       job.current = `${symbol}: fetching ${opts.interval} futures klines`;
       logLine(job, job.current);
       const last = await fetchFuturesKlines(
@@ -197,16 +230,11 @@ async function runJob(
         archiveEvents(job, 'klines'),
       );
       if (last.length < 50) {
-        throw new Error(
-          `${symbol}: only ${last.length} klines received from the archive`,
-        );
+        throw new Error(`${symbol}: only ${last.length} klines received from the archive`);
       }
-      job.current = `${symbol}: storing ${last.length} candles`;
-      await persistCandles(symbol, opts.interval, 'last', last.map(toCandle));
-      job.insertedCandles += last.length;
-      job.progress = base + (1 / 3) / symbols.length;
+      job.progress = base + step;
 
-      // --- 2. mark price klines (liquidation series) --------------------------
+      // --- 2. mark price klines (liquidation series) -----------------------
       job.current = `${symbol}: fetching ${opts.interval} mark price klines`;
       logLine(job, job.current);
       const mark = await fetchFuturesKlines(
@@ -217,15 +245,12 @@ async function runJob(
         'mark',
         archiveEvents(job, 'mark'),
       );
-      job.current = `${symbol}: storing ${mark.length} mark candles`;
-      await persistCandles(symbol, opts.interval, 'mark', mark.map(toCandle));
-      job.insertedCandles += mark.length;
-      job.progress = base + (2 / 3) / symbols.length;
       if (mark.length === 0) {
         logLine(job, `${symbol}: no mark klines available - liquidation will fall back to last price`);
       }
+      job.progress = base + 2 * step;
 
-      // --- 3. funding history (real settled rates) ----------------------------
+      // --- 3. funding history (real settled rates) -------------------------
       // The archive publishes funding monthly only, so coverage ends with the
       // last completed month - trades opened after that accrue no funding in
       // the simulation (a small, documented cost understatement).
@@ -238,9 +263,20 @@ async function runJob(
         archiveEvents(job, 'funding'),
       );
       const funding = joinMarkPrice(fundingRaw, mark, last);
-      await persistFunding(symbol, funding);
+      job.progress = base + 3 * step;
+
+      // --- 4. persist atomically -------------------------------------------
+      job.current = `${symbol}: storing ${last.length} + ${mark.length} candles, ${funding.length} funding`;
+      await replaceDataset(
+        symbol,
+        opts.interval,
+        last.map(toCandle),
+        mark.map(toCandle),
+        funding,
+      );
+      job.insertedCandles += last.length + mark.length;
       job.insertedFunding += funding.length;
-      job.progress = base + 1 / symbols.length;
+      job.progress = base + 3 * step;
 
       logLine(
         job,
@@ -249,8 +285,8 @@ async function runJob(
     } catch (e) {
       failures.push(symbol);
       const msg = e instanceof Error ? e.message : String(e);
-      logLine(job, `${symbol}: FAILED - ${msg} (skipping, continuing with remaining symbols)`);
-      job.progress = base + 1 / symbols.length;
+      logLine(job, `${symbol}: FAILED - ${msg} (existing stored data kept; continuing with remaining symbols)`);
+      job.progress = base + 3 * step;
     }
   }
 
@@ -261,10 +297,7 @@ async function runJob(
     job.error = `all symbols failed: ${failures.join(', ')}`;
     logLine(job, `FAILED: ${job.error}`);
   } else if (failures.length > 0) {
-    logLine(
-      job,
-      `Ingestion finished with warnings - failed symbols: ${failures.join(', ')}`,
-    );
+    logLine(job, `Ingestion finished with warnings - failed symbols: ${failures.join(', ')}`);
   } else {
     logLine(
       job,

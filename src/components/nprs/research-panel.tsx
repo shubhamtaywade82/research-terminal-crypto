@@ -139,7 +139,7 @@ const FORMULAS: { label: string; expression: string }[] = [
   { label: "ROI on deployed margin", expression: "ROI_margin = NetPnL / TotalMarginDeployed * 100" },
   { label: "LONG PnL", expression: "PnL_long = Q_total * (P_exit - P_avg)" },
   { label: "SHORT PnL", expression: "PnL_short = Q_total * (P_avg - P_exit)" },
-  { label: "Net PnL", expression: "NetPnL = GrossPnL - Fees - Funding - Slippage" },
+  { label: "Net PnL", expression: "NetPnL = GrossPnL - Fees - Funding   (slippage is already inside the fill prices)" },
 ]
 
 const STATE_FIELDS: { field: string; description: string }[] = [
@@ -185,11 +185,12 @@ const SIMULATOR_ASSUMPTIONS: string[] = [
   "Binance liquidation uses Mark Price and notional-dependent maintenance brackets; this simulator evaluates liquidation on the REAL mark-price klines from the Binance archive but uses a static MMR (default 0.5%) instead of historical notional brackets - a documented approximation.",
   "Within each candle, risk is evaluated pessimistically: liquidation is checked BEFORE averaging fills; if both a DCA level and liquidation level are touched in the same candle, the simulator assumes liquidation happened first.",
   "Limit fills are assumed filled at the limit price only if the candle range crosses it (no order-book queue modeling).",
-  "Take-profit counts only if the candle extreme crosses the derived target price; the fill is executed with taker fee and slippage applied (conservative).",
+  "Take-profit counts only if the candle extreme crosses the target price. That price is solved so the NET ROI after exit slippage and the taker fee equals the configured target, so a TAKE_PROFIT trade realises the target (conservative: no fill is credited above it).",
+  "Entries and trend-flip exits (E8) execute at the OPEN of the bar after the signal. The entry bar is managed in full (liquidation, DCA fills, take-profit, risk states), so no fill or liquidation on the entry candle is skipped. Max-hold, emergency and end-of-data exits are priced at the bar close and stamped with the close time.",
   "Funding is applied from real USDT-M funding history (or a configurable fixed rate), deducted from wallet and PnL progressively. Archive reality: the public archive publishes funding history as monthly files only, so the newest (still incomplete) month accrues no funding until its zip appears - a small, temporary understatement of costs for trades opened in that window.",
   "Isolated liquidation boundary approximated as P_liq = P_avg * (1 - 1/lev + MMR) for LONG (mirrored for SHORT); on liquidation the ENTIRE deployed margin is forfeited to the liquidation engine (Binance isolated-margin behavior) - nothing is returned to the wallet.",
   "Price, mark price and funding series are real Binance USDT-M perpetual data fetched over HTTPS from Binance's official public archive (data.binance.vision); the live ticker strip quotes the Binance spot REST API (data-api.binance.vision). Monthly-zip holes are detected after the merge and healed from daily files automatically. No synthetic or simulated price paths are used anywhere.",
-  "A 1-minute OHLC candle cannot reveal intrabar ordering; conservative ordering means results are more likely understated than overstated.",
+  "A candle (5m to 1d) cannot reveal the true intrabar path; the ordering rules above are conservative, so results are more likely understated than overstated for liquidation and overstated only where a dip-then-rally ordering is assumed.",
 ]
 
 const PAIRED_METRICS: string[] = [

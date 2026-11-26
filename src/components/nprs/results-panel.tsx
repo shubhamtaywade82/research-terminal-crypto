@@ -351,7 +351,7 @@ export function ResultsPanel({ detail, loading }: ResultsPanelProps) {
                   <span
                     className={`w-24 shrink-0 font-mono text-[10px] font-semibold uppercase ${riskTone(e.type)}`}
                   >
-                    {e.type.replace('_', ' ')}
+                    {e.type.replaceAll('_', ' ')}
                   </span>
                   <span className="text-[11px] leading-snug text-zinc-400">{e.message}</span>
                 </div>

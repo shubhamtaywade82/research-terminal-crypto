@@ -25,7 +25,7 @@ import { TradesTable } from '@/components/nprs/trades-table';
 import ResearchPanel from '@/components/nprs/research-panel';
 import { fmtPct, fmtSignedPct, fmtUsd } from '@/lib/format';
 import { DEFAULT_PARAMS, PRESETS } from '@/lib/nprs/defaults';
-import { getStrategy } from '@/lib/nprs/strategies';
+import { getStrategy, STRATEGIES } from '@/lib/nprs/strategies';
 import {
   CompareRow,
   DatasetInfo,
@@ -34,6 +34,28 @@ import {
   RunSummary,
   StrategyParams,
 } from '@/lib/nprs/types';
+
+type StatusPayload = { job: IngestJobState; datasets: DatasetInfo[] };
+
+/** Pure fetchers: return data (or null on failure) and never touch React state. */
+async function fetchStatusPayload(): Promise<StatusPayload | null> {
+  try {
+    const res = await fetch('/api/data/status');
+    return res.ok ? ((await res.json()) as StatusPayload) : null;
+  } catch {
+    return null; // server momentarily unavailable; keep previous state
+  }
+}
+
+async function fetchRunsPayload(): Promise<RunSummary[] | null> {
+  try {
+    const res = await fetch('/api/backtest');
+    if (!res.ok) return null;
+    return ((await res.json()) as { runs: RunSummary[] }).runs;
+  } catch {
+    return null;
+  }
+}
 
 export default function Page() {
   const { toast } = useToast();
@@ -52,34 +74,38 @@ export default function Page() {
   const [tab, setTab] = useState('run');
 
   const refreshStatus = useCallback(async () => {
-    try {
-      const res = await fetch('/api/data/status');
-      if (!res.ok) return;
-      const data = (await res.json()) as { job: IngestJobState; datasets: DatasetInfo[] };
+    const data = await fetchStatusPayload();
+    if (data) {
       setJob(data.job);
       setDatasets(data.datasets);
-    } catch {
-      // server momentarily unavailable; keep previous state
     }
   }, []);
 
   const refreshRuns = useCallback(async () => {
-    try {
-      const res = await fetch('/api/backtest');
-      if (!res.ok) return;
-      const data = (await res.json()) as { runs: RunSummary[] };
-      setRuns(data.runs);
-    } catch {
-      // ignore
-    } finally {
-      setRunsLoading(false);
-    }
+    const list = await fetchRunsPayload();
+    if (list) setRuns(list);
+    setRunsLoading(false);
   }, []);
 
+  // Initial load. State is only set inside promise callbacks, and the cleanup
+  // ignores responses that arrive after unmount.
   useEffect(() => {
-    void refreshStatus();
-    void refreshRuns();
-  }, [refreshStatus, refreshRuns]);
+    let active = true;
+    void fetchStatusPayload().then((data) => {
+      if (active && data) {
+        setJob(data.job);
+        setDatasets(data.datasets);
+      }
+    });
+    void fetchRunsPayload().then((list) => {
+      if (!active) return;
+      if (list) setRuns(list);
+      setRunsLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!job?.running) return;
@@ -227,9 +253,11 @@ export default function Page() {
   const deleteRun = useCallback(
     async (id: string) => {
       try {
-        await fetch(`/api/backtest/${id}`, { method: 'DELETE' });
+        const res = await fetch(`/api/backtest/${id}`, { method: 'DELETE' });
+        // 404 means it is already gone server-side, so drop it locally too.
+        if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
         setRuns((rs) => rs.filter((r) => r.id !== id));
-        if (detail?.id === id) setDetail(null);
+        setDetail((d) => (d?.id === id ? null : d));
         toast({ title: 'Experiment deleted' });
       } catch {
         toast({
@@ -239,7 +267,7 @@ export default function Page() {
         });
       }
     },
-    [detail?.id, toast],
+    [toast],
   );
 
   const applyPreset = useCallback(
@@ -377,7 +405,7 @@ export default function Page() {
                     {comparing ? (
                       <>
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        Comparing 8 strategies...
+                        Comparing {STRATEGIES.length} strategies...
                       </>
                     ) : (
                       <>
