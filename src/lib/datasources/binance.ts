@@ -32,6 +32,8 @@ import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { unzipSync } from 'fflate';
 import { FundingRow, Interval, RawKline } from '@/lib/nprs/types';
+import { archiveGate, spotGate } from '@/lib/net/hosts';
+import { RateLimitError, RequestBudget } from '@/lib/net/throttle';
 
 const ARCHIVE_HOST = 'https://data.binance.vision';
 const SPOT_API_HOST = 'https://data-api.binance.vision';
@@ -43,7 +45,6 @@ const CACHE_ROOT = path.join(process.env.NPRS_ROOT || process.cwd(), '.cache', '
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 const DOWNLOAD_CONCURRENCY = 3;
-const FETCH_ATTEMPTS = 3;
 
 // Publication lags observed on the archive: monthly zips appear up to ~2 days
 // after the month completes, daily zips within a few hours after the UTC day
@@ -100,13 +101,18 @@ function decompressZip(buf: Buffer): string {
   return new TextDecoder().decode(entries[name]);
 }
 
+/** Where a given archive path lives in the local cache (exists or not). */
+export function archiveCachePath(archivePath: string): string {
+  return path.join(CACHE_ROOT, archivePath.replace(/^\/+/, ''));
+}
+
 /**
  * Raw archive zip bytes: disk-cached, with retries on transport errors. A cached
  * copy that no longer unzips is treated as missing and downloaded again.
  */
 export async function fetchArchiveZip(
   archivePath: string,
-  opts: { validateCache?: boolean; force?: boolean } = {},
+  opts: { validateCache?: boolean; force?: boolean; budget?: RequestBudget } = {},
 ): Promise<{ buf: Buffer; cached: boolean }> {
   const url = `${ARCHIVE_HOST}${archivePath}`;
   const cachePath = path.join(CACHE_ROOT, archivePath.replace(/^\/+/, ''));
@@ -125,32 +131,24 @@ export async function fetchArchiveZip(
     }
   }
 
-  // 2. live download with retries (transport errors only; 404 aborts)
-  let lastErr: unknown = null;
-  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
-    if (attempt > 1) await sleep(attempt === 2 ? 800 : 2_000);
-    try {
-      const res = await fetch(url, {
-        signal: AbortSignal.timeout(90_000),
-        cache: 'no-store',
-      });
-      if (res.status === 404) throw new ArchiveNotFound(archivePath);
-      if (!res.ok) throw new Error(`HTTP ${res.status} from data.binance.vision`);
-      const buf = Buffer.from(await res.arrayBuffer());
-      unzipSync(new Uint8Array(buf)); // validate before caching
-      await mkdir(path.dirname(cachePath), { recursive: true });
-      await writeFile(cachePath, buf);
-      return { buf, cached: false };
-    } catch (e) {
-      if (e instanceof ArchiveNotFound) {
-        // remove any stale/corrupt cached copy of a file that no longer resolves
-        await unlink(cachePath).catch(() => undefined);
-        throw e;
-      }
-      lastErr = e;
-    }
+  // 2. network. Only real downloads consume the per-request budget; the gate owns
+  //    pacing, cooldowns and bounded retries for this host.
+  opts.budget?.consume();
+  const res = await archiveGate.fetch(url, {
+    signal: AbortSignal.timeout(90_000),
+    cache: 'no-store',
+  });
+  if (res.status === 404) {
+    // remove any stale/corrupt cached copy of a file that no longer resolves
+    await unlink(cachePath).catch(() => undefined);
+    throw new ArchiveNotFound(archivePath);
   }
-  throw lastErr instanceof Error ? lastErr : new Error(`download failed: ${archivePath}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status} from data.binance.vision`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  unzipSync(new Uint8Array(buf)); // validate before caching
+  await mkdir(path.dirname(cachePath), { recursive: true });
+  await writeFile(cachePath, buf);
+  return { buf, cached: false };
 }
 
 /** Download one archive zip and return its CSV text (disk-cached). */
@@ -510,16 +508,27 @@ const TICKER_TTL_MS = 15_000;
 // symbols to a caller that asks for a different list within the TTL.
 const tickerCache = new Map<string, { at: number; data: SpotTicker[] }>();
 
-/** Live 24h statistics from the Binance spot REST API (data-api mirror). */
+/**
+ * Live 24h statistics from the Binance spot REST API (data-api mirror). Cached per
+ * symbol set, and during a cooldown the last good snapshot is served instead of
+ * calling the host again.
+ */
 export async function fetchSpotTickers(symbols: string[]): Promise<SpotTicker[]> {
   const key = [...symbols].sort().join(',');
   const hit = tickerCache.get(key);
   if (hit && Date.now() - hit.at < TICKER_TTL_MS) return hit.data;
+
   const q = encodeURIComponent(JSON.stringify(symbols));
-  const res = await fetch(`${SPOT_API_HOST}/api/v3/ticker/24hr?symbols=${q}`, {
-    signal: AbortSignal.timeout(10_000),
-    cache: 'no-store',
-  });
+  let res: Response;
+  try {
+    res = await spotGate.fetch(`${SPOT_API_HOST}/api/v3/ticker/24hr?symbols=${q}`, {
+      signal: AbortSignal.timeout(10_000),
+      cache: 'no-store',
+    });
+  } catch (e) {
+    if (e instanceof RateLimitError && hit) return hit.data;
+    throw e;
+  }
   if (!res.ok) throw new Error(`ticker HTTP ${res.status} from data-api.binance.vision`);
   const rows = (await res.json()) as Array<{
     symbol: string;
@@ -541,20 +550,32 @@ export async function fetchSpotTickers(symbols: string[]): Promise<SpotTicker[]>
   return data;
 }
 
-/** Archive reachability probe used by the status endpoint. */
+// Archive reachability is probed at most once a minute, however often the status
+// endpoint is polled, and concurrent callers share one probe.
+const PROBE_TTL_MS = 60_000;
+let probeCache: { at: number; value: { ok: boolean; detail: string } } | null = null;
+let probeInflight: Promise<{ ok: boolean; detail: string }> | null = null;
+
 export async function probeArchive(): Promise<{ ok: boolean; detail: string }> {
-  try {
-    const res = await fetch(`${ARCHIVE_HOST}/?prefix=data/futures/um/monthly/klines/BTCUSDT/1h/`, {
-      signal: AbortSignal.timeout(10_000),
-      cache: 'no-store',
-    });
-    return {
-      ok: res.ok,
-      detail: res.ok
-        ? 'data.binance.vision reachable'
-        : `archive responded HTTP ${res.status}`,
-    };
-  } catch (e) {
-    return { ok: false, detail: e instanceof Error ? e.message : 'unreachable' };
-  }
+  if (probeCache && Date.now() - probeCache.at < PROBE_TTL_MS) return probeCache.value;
+  if (probeInflight) return probeInflight;
+  probeInflight = (async () => {
+    let value: { ok: boolean; detail: string };
+    try {
+      const res = await archiveGate.fetch(`${ARCHIVE_HOST}/?prefix=data/futures/um/monthly/klines/BTCUSDT/1h/`, {
+        signal: AbortSignal.timeout(10_000),
+        cache: 'no-store',
+      });
+      value = {
+        ok: res.ok,
+        detail: res.ok ? 'data.binance.vision reachable' : `archive responded HTTP ${res.status}`,
+      };
+    } catch (e) {
+      value = { ok: false, detail: e instanceof Error ? e.message : 'unreachable' };
+    }
+    probeCache = { at: Date.now(), value };
+    probeInflight = null;
+    return value;
+  })();
+  return probeInflight;
 }

@@ -60,7 +60,8 @@ async function fetchRunsPayload(): Promise<RunSummary[] | null> {
 export default function Page() {
   const { toast } = useToast();
 
-  const [params, setParams] = useState<StrategyParams>(DEFAULT_PARAMS);
+  // Tick is the default execution: exact order for fills, take-profit, liquidation and exits.
+  const [params, setParams] = useState<StrategyParams>({ ...DEFAULT_PARAMS, intrabarMode: 'tick' });
   const [label, setLabel] = useState('');
   const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
   const [job, setJob] = useState<IngestJobState | null>(null);
@@ -72,9 +73,19 @@ export default function Page() {
   const [comparing, setComparing] = useState(false);
   const [compareRows, setCompareRows] = useState<CompareRow[] | null>(null);
   const [tab, setTab] = useState('run');
-  // Optional UTC window (YYYY-MM-DD, end exclusive). Required by tick mode.
-  const [windowFrom, setWindowFrom] = useState('');
-  const [windowTo, setWindowTo] = useState('');
+  // UTC window (YYYY-MM-DD, end exclusive). Defaults to the last ten complete days of
+  // the selected dataset, so tick runs work without typing dates; typed values win.
+  const [windowFromOverride, setWindowFromOverride] = useState<string | null>(null);
+  const [windowToOverride, setWindowToOverride] = useState<string | null>(null);
+  const DAY_MS = 86_400_000;
+  const selectedDataset = datasets.find((d) => d.symbol === params.symbol && d.interval === params.interval);
+  // Start of the UTC day holding the last stored bar: that day is partial, so excluded.
+  const defaultEnd = selectedDataset?.to != null ? Math.floor(selectedDataset.to / DAY_MS) * DAY_MS : null;
+  const toDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  const windowFrom = windowFromOverride ?? (defaultEnd !== null ? toDay(defaultEnd - 10 * DAY_MS) : '');
+  const windowTo = windowToOverride ?? (defaultEnd !== null ? toDay(defaultEnd) : '');
+  const setWindowFrom = (v: string) => setWindowFromOverride(v);
+  const setWindowTo = (v: string) => setWindowToOverride(v);
   const windowMs = (day: string) => {
     const t = Date.parse(`${day}T00:00:00Z`);
     return Number.isFinite(t) ? t : null;
@@ -296,6 +307,7 @@ export default function Page() {
         ...preset.patch,
         symbol: prev.symbol,
         interval: prev.interval,
+        intrabarMode: prev.intrabarMode,
         startingEquity: prev.startingEquity,
         strategyId: prev.strategyId,
         signalParams: prev.signalParams,
@@ -411,8 +423,9 @@ export default function Page() {
                     </div>
                   </div>
                   <p className="text-[11px] leading-snug text-zinc-500">
-                    Optional for bar and refined. Tick mode needs a window of at most 31 days, and
-                    downloads one aggTrades day per UTC day on first use.
+                    Defaults to the last ten complete days of the selected dataset. Tick runs up to 366 days.
+                    Days not cached yet are downloaded at a paced rate, at most 60 per request; cached
+                    days are free, so long windows fill up over several runs.
                   </p>
                   <Label className="text-xs text-zinc-400">Experiment label (optional)</Label>
                   <Input

@@ -9,7 +9,10 @@
 
 import { unzipSync } from 'fflate';
 import { inflateRawSync } from 'node:zlib';
-import { ArchiveNotFound, assertArchiveArgs, fetchArchiveZip } from './binance';
+import { access } from 'node:fs/promises';
+import { archiveCachePath, ArchiveNotFound, assertArchiveArgs, fetchArchiveZip } from './binance';
+import { RequestBudget } from '@/lib/net/throttle';
+import { DEFAULT_DOWNLOADS_PER_REQUEST } from '@/lib/net/hosts';
 import type { IntrabarSource, IntrabarWindow } from '@/lib/nprs/types';
 
 const DAY_MS = 86_400_000;
@@ -101,6 +104,19 @@ export function fastCsv(zip: Buffer): Uint8Array {
   return entries[name];
 }
 
+/** Day keys in [fromMs, toMs) whose aggTrades zip is NOT yet in the local cache. */
+export async function uncachedAggTradeDays(symbol: string, fromMs: number, toMs: number): Promise<string[]> {
+  assertArchiveArgs(symbol);
+  const out: string[] = [];
+  for (let d = utcDayStart(fromMs); d < toMs; d += DAY_MS) {
+    const key = utcDayKey(d);
+    const file = archiveCachePath(`/data/futures/um/daily/aggTrades/${symbol}/${symbol}-aggTrades-${key}.zip`);
+    const cached = await access(file).then(() => true, () => false);
+    if (!cached) out.push(key);
+  }
+  return out;
+}
+
 /** UTC calendar day (YYYY-MM-DD) containing epoch ms `t`. */
 export function utcDayKey(t: number): string {
   return new Date(t).toISOString().slice(0, 10);
@@ -162,8 +178,16 @@ export interface AggTradeSource extends IntrabarSource {
  * days; a range touching an unpublished day returns null so the caller can fall
  * back explicitly rather than simulate on partial tick data.
  */
-export function createAggTradeSource(symbol: string, maxDaysInMemory = 2): AggTradeSource {
+export interface AggTradeSourceOptions {
+  maxDaysInMemory?: number;
+  /** New downloads this source may cause. Cache hits never consume it. */
+  budget?: RequestBudget;
+}
+
+export function createAggTradeSource(symbol: string, opts: AggTradeSourceOptions = {}): AggTradeSource {
   assertArchiveArgs(symbol);
+  const maxDaysInMemory = opts.maxDaysInMemory ?? 2;
+  const budget = opts.budget ?? new RequestBudget(DEFAULT_DOWNLOADS_PER_REQUEST);
   const days = new Map<string, IntrabarWindow | null>();
   const stats: AggTradeStats = { daysLoaded: 0, daysMissing: 0 };
 
@@ -179,12 +203,12 @@ export function createAggTradeSource(symbol: string, maxDaysInMemory = 2): AggTr
     try {
       const archivePath = `/data/futures/um/daily/aggTrades/${symbol}/${symbol}-aggTrades-${key}.zip`;
       // One unzip per day: the cache is not pre-validated; a corrupt copy is re-fetched.
-      let { buf } = await fetchArchiveZip(archivePath, { validateCache: false });
+      let { buf } = await fetchArchiveZip(archivePath, { validateCache: false, budget });
       let csv: Uint8Array;
       try {
         csv = fastCsv(buf);
       } catch {
-        ({ buf } = await fetchArchiveZip(archivePath, { force: true }));
+        ({ buf } = await fetchArchiveZip(archivePath, { force: true, budget }));
         csv = fastCsv(buf);
       }
       day = parseAggTradesCsv(new TextDecoder().decode(csv));

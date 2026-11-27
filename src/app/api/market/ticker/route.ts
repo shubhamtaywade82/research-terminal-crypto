@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { fetchSpotTickers } from '@/lib/datasources/binance';
+import { RateLimitError } from '@/lib/net/throttle';
 import { SYMBOLS } from '@/lib/nprs/defaults';
 
 export const dynamic = 'force-dynamic';
@@ -17,6 +18,12 @@ export async function GET() {
       fetchedAt: Date.now(),
     });
   } catch (e) {
+    if (e instanceof RateLimitError) {
+      return NextResponse.json(
+        { tickers: [], message: e.message },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(e.retryAfterMs / 1000)) } },
+      );
+    }
     return NextResponse.json(
       {
         tickers: [],

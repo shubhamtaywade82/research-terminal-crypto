@@ -24,7 +24,8 @@ import {
   getStrategy,
   STRATEGIES,
 } from '@/lib/nprs/strategies';
-import { createAggTradeSource } from '@/lib/datasources/aggtrades';
+import { createAggTradeSource, uncachedAggTradeDays } from '@/lib/datasources/aggtrades';
+import { DEFAULT_DOWNLOADS_PER_REQUEST, networkStats } from '@/lib/net/hosts';
 
 const EMPTY_METRICS: BacktestMetrics = {
   finalEquity: 0,
@@ -375,6 +376,22 @@ export async function POST(request: Request) {
   // Single-strategy mode (selected strategy, current params)
   // ------------------------------------------------------------------
   const label = customLabel || autoLabel(params);
+
+  // Tick needs every day of the window. Count the days that would have to be
+  // downloaded and refuse up front if they exceed the per-request budget, so no
+  // compute or network work starts for a request that cannot finish.
+  if (params.intrabarMode === 'tick' && range) {
+    const missing = await uncachedAggTradeDays(params.symbol, range.fromMs, range.toMs);
+    if (missing.length > DEFAULT_DOWNLOADS_PER_REQUEST) {
+      return NextResponse.json(
+        {
+          message: `This window needs ${missing.length} aggTrades days that are not cached yet, and one request may download at most ${DEFAULT_DOWNLOADS_PER_REQUEST}. Cached days are free: run the window in ranges that fit (the cache fills up as you go). First uncached day: ${missing[0]}.`,
+        },
+        { status: 400 },
+      );
+    }
+  }
+
   let result: Awaited<ReturnType<typeof executeRun>>;
   try {
     result = await executeRun(params, data, range, createAggTradeSource(params.symbol));
@@ -389,6 +406,7 @@ export async function POST(request: Request) {
   return NextResponse.json({
     id: stored.id,
     label,
+    network: networkStats(),
     strategyId: params.strategyId ?? 'ema-trend',
     intrabarMode: params.intrabarMode ?? 'bar',
     candles: result.candles,

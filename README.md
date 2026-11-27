@@ -119,6 +119,36 @@ aggregate-trade-ID order (the matching order) is what the reader keeps within a 
 - Max-hold and take-profit exits move to the print that triggers them, so holding times and
   excursions differ from `bar` even where the PnL matches.
 
+## Rate limits and bans
+
+Every outbound request goes through a gate in `src/lib/net/` (`throttle.ts`, `hosts.ts`), so
+the limits hold across routes, browser tabs and runs.
+
+**What the app sends to Binance**
+
+| Host | Used for | Policy |
+|---|---|---|
+| `data.binance.vision` (archive) | klines, mark klines, funding, aggTrades, and a reachability probe | at most 4 requests/s (250 ms spacing), 2 in flight, 3 attempts; 429 or 418 pauses the host for 60 s or 2 min; a bare 503 gets a short backoff; `Retry-After` is honoured but never shorter than the minimum; a pause longer than 10 s fails the call at once |
+| `data-api.binance.vision` (spot REST) | live ticker strip | 1 request/s, 1 in flight; 15 s server-side cache; a throttle is reported at once with `Retry-After`, never waited out |
+
+**Other safeguards**
+
+- The archive probe runs at most once a minute, however often the status endpoint is polled.
+- A request may download at most **60** uncached aggTrades days (`NPRS_MAX_DOWNLOADS_PER_REQUEST`).
+  Cached days are free. A tick window needing more is refused before any download starts.
+- Concurrent callers share one probe and one ticker fetch per symbol set.
+- During a cooldown, requests fail at once without contacting the host.
+- The live counters (requests, throttles, errors, cooldown remaining) are in `/api/data/status`
+  and in every backtest response under `network`.
+
+**What is and isn't verified.** Binance's REST documentation (checked for this policy) defines
+429 for over-limit, 418 for an IP ban that escalates from 2 minutes to 3 days, and a `Retry-After`
+header on both. It doesn't publish the throttling rules for `data.binance.vision`, so the archive
+policy is conservative rather than measured against a published limit. In the verification runs
+no throttle response was received: a 40-day tick run made 32 archive requests (31 day downloads
+and one probe), 46 status polls made none beyond the cached probe, and 30 ticker calls made one
+spot request.
+
 ## Architecture
 
 ```

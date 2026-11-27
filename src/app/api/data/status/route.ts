@@ -3,6 +3,7 @@ import { db } from '@/lib/db';
 import { DATA_SOURCE_LABEL, getJob } from '@/lib/ingest';
 import { DatasetInfo, INTERVAL_MS } from '@/lib/nprs/types';
 import { probeArchive } from '@/lib/datasources/binance';
+import { networkStats } from '@/lib/net/hosts';
 
 export const dynamic = 'force-dynamic';
 
@@ -64,5 +65,6 @@ export async function GET() {
     datasets,
     source: DATA_SOURCE_LABEL,
     archive: { ok: archive.ok, detail: archive.detail, host: 'data.binance.vision' },
+    network: networkStats(),
   });
 }

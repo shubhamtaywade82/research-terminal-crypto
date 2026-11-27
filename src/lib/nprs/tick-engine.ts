@@ -59,8 +59,11 @@ export interface TickResult extends BacktestResult {
   tickStats: { prints: number; days: number };
 }
 
-/** Maximum days of aggTrades one tick run may span (guards disk and runtime). */
-export const TICK_MAX_DAYS = 31;
+/**
+ * Longest window one tick run may span. Days stream one at a time from the cache, so
+ * the limit is about runtime (about 1 s per million prints) rather than memory.
+ */
+export const TICK_MAX_DAYS = 366;
 
 export async function runTickBacktest(
   params: StrategyParams,
