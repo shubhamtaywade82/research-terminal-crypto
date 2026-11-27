@@ -81,6 +81,44 @@ multiplier, ...), all validated and clamped server-side.
 Documented simplifications vs. Binance: static (tier-1) maintenance-margin rate instead of
 notional brackets, no queue modeling for limit fills, funding archive lags the current month.
 
+## Execution modes (`intrabarMode`)
+
+The signal is always decided on the dataset interval (default 1h, or 1m); what changes is how
+fills, take-profit, liquidation and exits are ordered within that bar.
+
+| Mode | How intrabar order is resolved | Data needed | Speed |
+|---|---|---|---|
+| `bar` (default) | OHLC heuristic: fills first, then take-profit (dip-then-rally) | klines + mark klines | fastest |
+| `refined` | Bars where a DCA limit is reachable are replayed from their aggTrades prints in order; other bars use `bar` | + aggTrades for those days (fallback if missing, counted in the result) | several seconds per 10 days |
+| `tick` | Every aggTrades print is an event: funding at its timestamp, liquidation on each print and on the finest mark bar, DCA fills and take-profit on the print that crosses them, max hold on the first print past the limit | aggTrades for every day in the window (the run fails otherwise); window ≤ 31 days | about 1 s per million prints |
+
+Signals are computed from bar closes and acted on at the next bar's first print in `tick` mode
+(or the open in `bar` and `refined`), so no mode uses a future price to decide.
+
+**Measured on BTCUSDT, 10 days (1–10 Nov 2026), 1h signal bars**
+
+- `ema-trend`, DCA grid 0.2%, take-profit 3%: `bar` **−29.5%** (15 trades), `refined` and `tick`
+  **+20.1%** (37 trades each). Refined and tick agree on every PnL-determining field except two
+  entry/exit prices that differ by about 0.1 USDT (see the data check below).
+- `ema-trend` and `macd` at 0.5% and 1% grids (3% and 10% targets), and `macd` at 0.2%: all three
+  modes agree exactly. The OHLC ordering guess only changes outcomes when a bar can fill a DCA
+  limit and reach the take-profit in the opposite order, so tight grids on coarse bars are where
+  it matters. `ema-trend` at 0.2% is the case where it does.
+
+**Data check.** The stored 1m klines were compared with the aggTrades prints of one full UTC day
+(1,440 minutes). Close matches in all minutes; open in 97.1%; high and low in 99.8%. Largest
+difference 0.4 USDT. About 62% of prints share a millisecond with a neighbour, and the archive's
+aggregate-trade-ID order (the matching order) is what the reader keeps within a millisecond.
+
+**Limits of `tick` mode**
+
+- The archive has no mark-price ticks, so liquidation timing is bounded by the finest mark bar
+  (1m). A breach of that bar's extreme counts as a liquidation at the first print inside it.
+- Fixed-rate funding is accrued per signal bar, not per print. Historical funding is exact.
+- Timestamps in `bar` mode are bar-resolution; `tick` stamps the actual print time.
+- Max-hold and take-profit exits move to the print that triggers them, so holding times and
+  excursions differ from `bar` even where the PnL matches.
+
 ## Architecture
 
 ```

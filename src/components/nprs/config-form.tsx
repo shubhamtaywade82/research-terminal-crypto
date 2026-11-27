@@ -267,6 +267,17 @@ export function ConfigForm({ params, onChange, disabled }: ConfigFormProps) {
             onChange={(v) => set({ interval: v as Interval })}
             disabled={disabled}
           />
+          <SelectField
+            label="Execution (intrabar order)"
+            value={params.intrabarMode ?? 'bar'}
+            options={[
+              { value: 'bar', label: 'OHLC bars (fast)' },
+              { value: 'refined', label: 'OHLC + aggTrades where needed' },
+              { value: 'tick', label: 'aggTrades ticks (needs a window)' },
+            ]}
+            onChange={(v) => set({ intrabarMode: v as StrategyParams['intrabarMode'] })}
+            disabled={disabled}
+          />
           <NumField
             label="Starting equity (USDT)"
             value={params.startingEquity}

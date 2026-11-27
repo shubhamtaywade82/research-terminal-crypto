@@ -67,10 +67,34 @@ export type RiskEventType =
   | 'ENTRY_SKIPPED'
   | 'LIQUIDATION';
 
+/**
+ * Execution fidelity:
+ *  - 'bar'     : OHLC bars. Intrabar order inferred (dip-then-rally). Fast.
+ *  - 'refined' : OHLC bars, but a bar where a DCA limit is reachable is replayed from
+ *                its aggTrades prints in time order. Exact order on those bars only.
+ *  - 'tick'    : event-driven over every aggTrades print in the window. Decisions are
+ *                still taken on the signal bars; fills, take-profit, liquidation and
+ *                exits are evaluated trade by trade.
+ */
+export type IntrabarMode = 'bar' | 'refined' | 'tick';
+
+/** Time-ordered trade prints for one window: t in epoch ms, p = trade price. */
+export interface IntrabarWindow {
+  t: Float64Array;
+  p: Float64Array;
+}
+
+/** Supplies trade prints for [fromMs, toMs); null when the trades are unavailable. */
+export interface IntrabarSource {
+  window(fromMs: number, toMs: number): Promise<IntrabarWindow | null>;
+}
+
 export interface StrategyParams {
   // Market & dataset
   symbol: string;
   interval: Interval;
+  /** Intrabar ordering (optional so runs stored before this field still load). */
+  intrabarMode?: IntrabarMode;
 
   // Capital & sizing (spec sections 1/2)
   startingEquity: number;
@@ -221,6 +245,10 @@ export interface BacktestMetrics {
   longWinRatePct: number | null;
   shortWinRatePct: number | null;
   depthStats: DepthStat[];
+  /** Bars whose intrabar order was resolved from aggTrades prints. */
+  intrabarRefinedBars: number;
+  /** Bars that needed aggTrades but had none; resolved with the OHLC rule instead. */
+  intrabarFallbackBars: number;
 }
 
 export interface BacktestResult {

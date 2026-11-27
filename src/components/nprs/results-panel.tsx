@@ -122,6 +122,17 @@ export function ResultsPanel({ detail, loading }: ResultsPanelProps) {
         <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-400">
           {detail.trades.length} trades
         </Badge>
+        {p.intrabarMode && p.intrabarMode !== 'bar' ? (
+          <Badge
+            variant="outline"
+            className="border-sky-500/40 bg-sky-500/10 text-[10px] text-sky-300"
+          >
+            exec {p.intrabarMode}
+            {p.intrabarMode === 'refined'
+              ? ` · ${m.intrabarRefinedBars} bars refined · ${m.intrabarFallbackBars} fallback`
+              : ''}
+          </Badge>
+        ) : null}
         {m.markPriceLiq ? (
           <Badge
             variant="outline"

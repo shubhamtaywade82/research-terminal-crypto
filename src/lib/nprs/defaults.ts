@@ -21,6 +21,7 @@ export const SYMBOL_MMR_PCT: Record<string, number> = {
 export const DEFAULT_PARAMS: StrategyParams = {
   symbol: 'BTCUSDT',
   interval: '1h',
+  intrabarMode: 'bar',
   strategyId: 'ema-trend',
   signalParams: {},
   startingEquity: 10_000,

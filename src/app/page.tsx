@@ -72,6 +72,19 @@ export default function Page() {
   const [comparing, setComparing] = useState(false);
   const [compareRows, setCompareRows] = useState<CompareRow[] | null>(null);
   const [tab, setTab] = useState('run');
+  // Optional UTC window (YYYY-MM-DD, end exclusive). Required by tick mode.
+  const [windowFrom, setWindowFrom] = useState('');
+  const [windowTo, setWindowTo] = useState('');
+  const windowMs = (day: string) => {
+    const t = Date.parse(`${day}T00:00:00Z`);
+    return Number.isFinite(t) ? t : null;
+  };
+  const windowBounds = (() => {
+    const from = windowFrom ? windowMs(windowFrom) : null;
+    const to = windowTo ? windowMs(windowTo) : null;
+    return from !== null && to !== null && to > from ? { from, to } : null;
+  })();
+  const needsWindow = params.intrabarMode === 'tick' && windowBounds === null;
 
   const refreshStatus = useCallback(async () => {
     const data = await fetchStatusPayload();
@@ -173,7 +186,11 @@ export default function Page() {
       const res = await fetch('/api/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...params, label: label.trim() || undefined }),
+        body: JSON.stringify({
+          ...params,
+          label: label.trim() || undefined,
+          ...(windowBounds ? { windowFromMs: windowBounds.from, windowToMs: windowBounds.to } : {}),
+        }),
       });
       const data = (await res.json()) as {
         id?: string;
@@ -205,7 +222,7 @@ export default function Page() {
     } finally {
       setRunning(false);
     }
-  }, [label, loadDetail, params, refreshRuns, toast]);
+  }, [label, loadDetail, params, refreshRuns, toast, windowBounds]);
 
   const compareStrategies = useCallback(async () => {
     setComparing(true);
@@ -371,6 +388,32 @@ export default function Page() {
                 <ConfigForm params={params} onChange={setParams} disabled={running} />
 
                 <div className="space-y-2 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-1">
+                      <Label className="text-xs text-zinc-400">Window from (UTC)</Label>
+                      <Input
+                        type="date"
+                        className="h-8 border-zinc-800 bg-zinc-950 font-mono text-sm"
+                        value={windowFrom}
+                        onChange={(e) => setWindowFrom(e.target.value)}
+                        disabled={running}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-xs text-zinc-400">Window to (exclusive)</Label>
+                      <Input
+                        type="date"
+                        className="h-8 border-zinc-800 bg-zinc-950 font-mono text-sm"
+                        value={windowTo}
+                        onChange={(e) => setWindowTo(e.target.value)}
+                        disabled={running}
+                      />
+                    </div>
+                  </div>
+                  <p className="text-[11px] leading-snug text-zinc-500">
+                    Optional for bar and refined. Tick mode needs a window of at most 31 days, and
+                    downloads one aggTrades day per UTC day on first use.
+                  </p>
                   <Label className="text-xs text-zinc-400">Experiment label (optional)</Label>
                   <Input
                     className="h-8 border-zinc-800 bg-zinc-950 font-mono text-sm"
@@ -381,7 +424,7 @@ export default function Page() {
                   />
                   <Button
                     className="w-full bg-emerald-600 font-semibold text-zinc-950 hover:bg-emerald-500"
-                    disabled={running || comparing || job?.running === true}
+                    disabled={running || comparing || job?.running === true || needsWindow}
                     onClick={() => void runBacktest()}
                   >
                     {running ? (

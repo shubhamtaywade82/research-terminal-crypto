@@ -72,7 +72,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // cache paths. Validate at the data-source boundary too (not only in the API
 // route), so a value like "../x" can never escape CACHE_ROOT.
 const SYMBOL_RE = /^[A-Z0-9]{2,20}$/;
-function assertArchiveArgs(symbol: string, interval?: string): void {
+export function assertArchiveArgs(symbol: string, interval?: string): void {
   if (!SYMBOL_RE.test(symbol)) throw new Error(`invalid symbol: ${JSON.stringify(symbol)}`);
   if (interval !== undefined && !(interval in INTERVAL_STEP_MS)) {
     throw new Error(`unsupported interval: ${JSON.stringify(interval)}`);
@@ -80,7 +80,7 @@ function assertArchiveArgs(symbol: string, interval?: string): void {
 }
 
 /** Raised when the archive answers 404 (file not published / not listed). */
-class ArchiveNotFound extends Error {
+export class ArchiveNotFound extends Error {
   constructor(file: string) {
     super(`not published: ${file}`);
     this.name = 'ArchiveNotFound';
@@ -101,19 +101,28 @@ function decompressZip(buf: Buffer): string {
 }
 
 /**
- * Download one archive zip (real HTTP request) and return its CSV text.
- * Disk-cached; cache corruption self-heals by re-downloading.
+ * Raw archive zip bytes: disk-cached, with retries on transport errors. A cached
+ * copy that no longer unzips is treated as missing and downloaded again.
  */
-async function fetchArchiveCsv(archivePath: string): Promise<{ text: string; cached: boolean }> {
+export async function fetchArchiveZip(
+  archivePath: string,
+  opts: { validateCache?: boolean; force?: boolean } = {},
+): Promise<{ buf: Buffer; cached: boolean }> {
   const url = `${ARCHIVE_HOST}${archivePath}`;
   const cachePath = path.join(CACHE_ROOT, archivePath.replace(/^\/+/, ''));
+  const validateCache = opts.validateCache ?? true;
 
-  // 1. disk cache
-  try {
-    const cached = await readFile(cachePath);
-    return { text: decompressZip(cached), cached: true };
-  } catch {
-    // not cached (or corrupt) - fall through to download
+  // 1. disk cache. By default it is unzip-validated so a corrupt copy self-heals;
+  //    callers that unzip the bytes themselves pass validateCache: false and
+  //    re-fetch with force: true if their own unzip fails.
+  if (!opts.force) {
+    try {
+      const cached = await readFile(cachePath);
+      if (validateCache) unzipSync(new Uint8Array(cached));
+      return { buf: cached, cached: true };
+    } catch {
+      // not cached (or corrupt) - fall through to download
+    }
   }
 
   // 2. live download with retries (transport errors only; 404 aborts)
@@ -128,10 +137,10 @@ async function fetchArchiveCsv(archivePath: string): Promise<{ text: string; cac
       if (res.status === 404) throw new ArchiveNotFound(archivePath);
       if (!res.ok) throw new Error(`HTTP ${res.status} from data.binance.vision`);
       const buf = Buffer.from(await res.arrayBuffer());
-      const text = decompressZip(buf); // validate before caching
+      unzipSync(new Uint8Array(buf)); // validate before caching
       await mkdir(path.dirname(cachePath), { recursive: true });
       await writeFile(cachePath, buf);
-      return { text, cached: false };
+      return { buf, cached: false };
     } catch (e) {
       if (e instanceof ArchiveNotFound) {
         // remove any stale/corrupt cached copy of a file that no longer resolves
@@ -142,6 +151,12 @@ async function fetchArchiveCsv(archivePath: string): Promise<{ text: string; cac
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(`download failed: ${archivePath}`);
+}
+
+/** Download one archive zip and return its CSV text (disk-cached). */
+async function fetchArchiveCsv(archivePath: string): Promise<{ text: string; cached: boolean }> {
+  const { buf, cached } = await fetchArchiveZip(archivePath);
+  return { text: decompressZip(buf), cached };
 }
 
 function parseKlinesCsv(

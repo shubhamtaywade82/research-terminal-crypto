@@ -153,5 +153,7 @@ export function computeMetrics(
     shortWinRatePct: winRateOf(shorts),
     depthStats,
     markPriceLiq,
+    intrabarRefinedBars: 0,
+    intrabarFallbackBars: 0,
   };
 }

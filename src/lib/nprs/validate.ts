@@ -72,6 +72,7 @@ export function sanitizeParams(raw: unknown): StrategyParams {
         ? r.symbol.trim().toUpperCase().slice(0, 20)
         : d.symbol,
     interval: pick<Interval>(r.interval, INTERVALS, d.interval),
+    intrabarMode: pick(r.intrabarMode, ['bar', 'refined', 'tick'] as const, d.intrabarMode ?? 'bar'),
     startingEquity: num(r.startingEquity, d.startingEquity, 100, 10_000_000),
     initialAllocPct: num(r.initialAllocPct, d.initialAllocPct, 0.1, 100),
     leverage: num(r.leverage, d.leverage, 1, 125),
