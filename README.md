@@ -149,6 +149,29 @@ no throttle response was received: a 40-day tick run made 32 archive requests (3
 and one probe), 46 status polls made none beyond the cached probe, and 30 ticker calls made one
 spot request.
 
+## Operations: responsiveness, memory and diagnostics
+
+Large ingests (a 1m series is about 261k candles per symbol per six months) used to freeze the
+server for up to a minute during the write. What changed:
+
+- **Writes are multi-row raw INSERTs** (500 rows per statement, values bound as parameters),
+  inside the same transaction as the delete, so a dataset is still replaced atomically. The
+  previous Prisma `createMany` path cost about 130 ms of CPU per 1,000 rows.
+- **The ingest yields to the event loop** between downloaded files and insert batches.
+- **Archive files are inflated once**, with Node's native zlib (`src/lib/datasources/zip.ts`).
+- **SQLite runs in WAL mode** with a busy timeout. Read-only routes (status, run list, run
+  detail) use a separate read connection, so they do not queue behind a write.
+- **Dataset coverage is cached** until a dataset write commits, so polling does not re-aggregate
+  millions of rows.
+
+Measured on a four-symbol 1m ingest (39 s, 33 status and static probes, all HTTP 200): status
+median 19 ms (p95 501 ms; it was about 430 ms idle before the cache), peak server memory 587 MB
+(it was 1.48 GB), worst event-loop block about 0.9 s (it was 62.6 s). The stored rows match the
+archive: row counts, first and last timestamps, OHLCV sums and funding all agree.
+
+**Diagnostics.** Start the server with `NPRS_DIAG=1` to log event-loop blocks above 150 ms with
+timestamps, the worst block per 10 seconds, and the phases of each ingest write.
+
 ## Architecture
 
 ```

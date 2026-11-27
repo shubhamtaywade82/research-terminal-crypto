@@ -7,8 +7,7 @@
 // shared archive client) and decoded into typed arrays, with a small LRU in memory:
 // a backtest walks days in order, so each day is decoded once per run.
 
-import { unzipSync } from 'fflate';
-import { inflateRawSync } from 'node:zlib';
+import { csvBytes, yieldToEventLoop } from './zip';
 import { access } from 'node:fs/promises';
 import { archiveCachePath, ArchiveNotFound, assertArchiveArgs, fetchArchiveZip } from './binance';
 import { RequestBudget } from '@/lib/net/throttle';
@@ -16,47 +15,6 @@ import { DEFAULT_DOWNLOADS_PER_REQUEST } from '@/lib/net/hosts';
 import type { IntrabarSource, IntrabarWindow } from '@/lib/nprs/types';
 
 const DAY_MS = 86_400_000;
-
-/**
- * First CSV entry of a zip, inflated with Node's native zlib (several times faster
- * than the pure-JS unzip on a 100 MB day file). Reads the central directory, so
- * the local header's data-descriptor flags do not matter. Returns null when the
- * layout is not one this reader handles; the caller then uses fflate.
- */
-export function inflateFirstCsv(zip: Uint8Array): Uint8Array | null {
-  const buf = Buffer.from(zip.buffer, zip.byteOffset, zip.byteLength);
-  const eocd = (() => {
-    for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65_557); i--) {
-      if (buf.readUInt32LE(i) === 0x06054b50) return i;
-    }
-    return -1;
-  })();
-  if (eocd < 0) return null;
-  let off = buf.readUInt32LE(eocd + 16); // central directory offset
-  const entries = buf.readUInt16LE(eocd + 10);
-  for (let e = 0; e < entries; e++) {
-    if (buf.readUInt32LE(off) !== 0x02014b50) return null;
-    const method = buf.readUInt16LE(off + 10);
-    const compSize = buf.readUInt32LE(off + 20);
-    const nameLen = buf.readUInt16LE(off + 28);
-    const extraLen = buf.readUInt16LE(off + 30);
-    const commentLen = buf.readUInt16LE(off + 32);
-    const localOff = buf.readUInt32LE(off + 42);
-    const name = buf.toString('utf8', off + 46, off + 46 + nameLen);
-    if (name.toLowerCase().endsWith('.csv')) {
-      if (buf.readUInt32LE(localOff) !== 0x04034b50) return null;
-      const lNameLen = buf.readUInt16LE(localOff + 26);
-      const lExtraLen = buf.readUInt16LE(localOff + 28);
-      const start = localOff + 30 + lNameLen + lExtraLen;
-      const data = buf.subarray(start, start + compSize);
-      if (method === 0) return new Uint8Array(data);
-      if (method === 8) return new Uint8Array(inflateRawSync(data));
-      return null;
-    }
-    off += 46 + nameLen + extraLen + commentLen;
-  }
-  return null;
-}
 
 /** Parse an aggTrades CSV into time-ordered (t, p) arrays. Malformed rows are skipped. */
 export function parseAggTradesCsv(text: string): IntrabarWindow {
@@ -91,17 +49,6 @@ export function parseAggTradesCsv(text: string): IntrabarWindow {
     };
   }
   return { t: Float64Array.from(t), p: Float64Array.from(p) };
-}
-
-/** CSV bytes of a day zip: native inflate when possible, fflate otherwise. */
-export function fastCsv(zip: Buffer): Uint8Array {
-  const native = inflateFirstCsv(new Uint8Array(zip));
-  if (native) return native;
-  const entries = unzipSync(new Uint8Array(zip));
-  const name =
-    Object.keys(entries).find((n) => n.toLowerCase().endsWith('.csv')) ?? Object.keys(entries)[0];
-  if (!name) throw new Error('zip archive contains no files');
-  return entries[name];
 }
 
 /** Day keys in [fromMs, toMs) whose aggTrades zip is NOT yet in the local cache. */
@@ -206,11 +153,12 @@ export function createAggTradeSource(symbol: string, opts: AggTradeSourceOptions
       let { buf } = await fetchArchiveZip(archivePath, { validateCache: false, budget });
       let csv: Uint8Array;
       try {
-        csv = fastCsv(buf);
+        csv = csvBytes(new Uint8Array(buf));
       } catch {
         ({ buf } = await fetchArchiveZip(archivePath, { force: true, budget }));
-        csv = fastCsv(buf);
+        csv = csvBytes(new Uint8Array(buf));
       }
+      await yieldToEventLoop();
       day = parseAggTradesCsv(new TextDecoder().decode(csv));
       stats.daysLoaded += 1;
     } catch (e) {

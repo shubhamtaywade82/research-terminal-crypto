@@ -30,9 +30,9 @@
 
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { unzipSync } from 'fflate';
 import { FundingRow, Interval, RawKline } from '@/lib/nprs/types';
 import { archiveGate, spotGate } from '@/lib/net/hosts';
+import { csvBytes, yieldToEventLoop } from './zip';
 import { RateLimitError, RequestBudget } from '@/lib/net/throttle';
 
 const ARCHIVE_HOST = 'https://data.binance.vision';
@@ -92,14 +92,6 @@ export class ArchiveNotFound extends Error {
 // Low-level zip + CSV helpers
 // ---------------------------------------------------------------------------
 
-function decompressZip(buf: Buffer): string {
-  const entries = unzipSync(new Uint8Array(buf));
-  const name =
-    Object.keys(entries).find((n) => n.toLowerCase().endsWith('.csv')) ??
-    Object.keys(entries)[0];
-  if (!name) throw new Error('zip archive contains no files');
-  return new TextDecoder().decode(entries[name]);
-}
 
 /** Where a given archive path lives in the local cache (exists or not). */
 export function archiveCachePath(archivePath: string): string {
@@ -124,7 +116,7 @@ export async function fetchArchiveZip(
   if (!opts.force) {
     try {
       const cached = await readFile(cachePath);
-      if (validateCache) unzipSync(new Uint8Array(cached));
+      if (validateCache) csvBytes(new Uint8Array(cached));
       return { buf: cached, cached: true };
     } catch {
       // not cached (or corrupt) - fall through to download
@@ -145,16 +137,24 @@ export async function fetchArchiveZip(
   }
   if (!res.ok) throw new Error(`HTTP ${res.status} from data.binance.vision`);
   const buf = Buffer.from(await res.arrayBuffer());
-  unzipSync(new Uint8Array(buf)); // validate before caching
+  csvBytes(new Uint8Array(buf)); // validate before caching
   await mkdir(path.dirname(cachePath), { recursive: true });
   await writeFile(cachePath, buf);
   return { buf, cached: false };
 }
 
-/** Download one archive zip and return its CSV text (disk-cached). */
+/**
+ * CSV text of one archive zip, disk-cached. The decode itself validates the bytes: a
+ * cached copy that no longer decodes is re-fetched once, so the file is inflated once.
+ */
 async function fetchArchiveCsv(archivePath: string): Promise<{ text: string; cached: boolean }> {
-  const { buf, cached } = await fetchArchiveZip(archivePath);
-  return { text: decompressZip(buf), cached };
+  const first = await fetchArchiveZip(archivePath, { validateCache: false });
+  try {
+    return { text: new TextDecoder().decode(csvBytes(new Uint8Array(first.buf))), cached: first.cached };
+  } catch {
+    const again = await fetchArchiveZip(archivePath, { force: true });
+    return { text: new TextDecoder().decode(csvBytes(new Uint8Array(again.buf))), cached: false };
+  }
 }
 
 function parseKlinesCsv(
@@ -404,6 +404,7 @@ export async function fetchFuturesKlines(
         const { text, cached } = await fetchArchiveCsv(task.archivePath);
         const rows = parseKlinesCsv(text, startMs, endMs, merged);
         events?.onFile?.(task.file, cached ? 'cached' : 'downloaded', rows);
+        await yieldToEventLoop();
       } catch (e) {
         if (e instanceof ArchiveNotFound) {
           events?.onFile?.(task.file, 'missing', 0);
@@ -444,6 +445,7 @@ export async function fetchFuturesKlines(
             const before = merged.size;
             parseKlinesCsv(text, startMs, endMs, merged);
             events?.onFile?.(`${symbol}-${interval}-${ymd}.zip`, 'healed', merged.size - before);
+            await yieldToEventLoop();
           } catch (e) {
             if (e instanceof ArchiveNotFound) {
               events?.onFile?.(`${symbol}-${interval}-${ymd}.zip`, 'missing', 0);
@@ -478,6 +480,7 @@ export async function fetchFundingHistory(
         const { text, cached } = await fetchArchiveCsv(task.archivePath);
         const rows = parseFundingCsv(text, startMs, endMs, merged);
         events?.onFile?.(task.file, cached ? 'cached' : 'downloaded', rows);
+        await yieldToEventLoop();
       } catch (e) {
         if (e instanceof ArchiveNotFound) {
           events?.onFile?.(task.file, 'missing', 0);

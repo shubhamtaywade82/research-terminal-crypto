@@ -17,6 +17,8 @@ import {
   fetchFuturesKlines,
 } from '@/lib/datasources/binance';
 import { RawKline } from '@/lib/nprs/types';
+import { yieldToEventLoop } from '@/lib/datasources/zip';
+import { bumpDatasetVersion } from '@/lib/datasets-version';
 import { Candle, FundingEvent, IngestJobState, Interval } from '@/lib/nprs/types';
 
 export const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'];
@@ -72,45 +74,75 @@ function archiveEvents(job: IngestJobState, kindLabel: string): ArchiveEvents {
   };
 }
 
-type Tx = Prisma.TransactionClient;
+export type Tx = Prisma.TransactionClient;
 
 const CHUNK = 1000;
 
-async function insertCandles(
+/**
+ * Rows per multi-row INSERT. Values are bound as parameters (never interpolated), and
+ * 500 rows x 9 columns stays under SQLite's bind-parameter limit.
+ */
+const INSERT_ROWS = 500;
+
+/**
+ * Multi-row INSERT through the transaction's raw driver. About ten times cheaper than
+ * Prisma createMany for the same rows, and it keeps the batch's CPU work short, so the
+ * server stays responsive during a large write. DateTime values use the same ISO text
+ * form the Prisma client writes, so rows read back identically.
+ */
+async function insertRows(
+  tx: Tx,
+  table: string,
+  columns: string[],
+  rows: unknown[][],
+): Promise<void> {
+  const cols = columns.join(', ');
+  const width = columns.length;
+  const one = `(${Array(width).fill('?').join(', ')})`;
+  for (let i = 0; i < rows.length; i += INSERT_ROWS) {
+    const batch = rows.slice(i, i + INSERT_ROWS);
+    const params: unknown[] = [];
+    for (const r of batch) params.push(...r);
+    await tx.$executeRawUnsafe(
+      `INSERT INTO ${table} (${cols}) VALUES ${batch.map(() => one).join(', ')}`,
+      ...params,
+    );
+    await yieldToEventLoop();
+  }
+}
+
+export async function insertCandles(
   tx: Tx,
   symbol: string,
   interval: string,
   kind: 'last' | 'mark',
-  candles: Candle[],
+  candles: RawKline[],
 ): Promise<void> {
-  for (let i = 0; i < candles.length; i += CHUNK) {
-    await tx.candle.createMany({
-      data: candles.slice(i, i + CHUNK).map((c) => ({
-        symbol,
-        interval,
-        kind,
-        openTime: new Date(c.t),
-        open: c.o,
-        high: c.h,
-        low: c.l,
-        close: c.c,
-        volume: c.v,
-      })),
-    });
-  }
+  await insertRows(
+    tx,
+    'Candle',
+    ['symbol', 'interval', 'kind', 'openTime', 'open', 'high', 'low', 'close', 'volume'],
+    candles.map((c) => [
+      symbol,
+      interval,
+      kind,
+      new Date(c.openTime).toISOString(),
+      c.open,
+      c.high,
+      c.low,
+      c.close,
+      c.volume,
+    ]),
+  );
 }
 
-async function insertFunding(tx: Tx, symbol: string, funding: FundingEvent[]): Promise<void> {
-  for (let i = 0; i < funding.length; i += CHUNK) {
-    await tx.fundingRate.createMany({
-      data: funding.slice(i, i + CHUNK).map((f) => ({
-        symbol,
-        fundingTime: new Date(f.t),
-        rate: f.rate,
-        markPrice: f.markPrice,
-      })),
-    });
-  }
+export async function insertFunding(tx: Tx, symbol: string, funding: FundingEvent[]): Promise<void> {
+  await insertRows(
+    tx,
+    'FundingRate',
+    ['symbol', 'fundingTime', 'rate', 'markPrice'],
+    funding.map((f) => [symbol, new Date(f.t).toISOString(), f.rate, f.markPrice]),
+  );
 }
 
 /**
@@ -122,20 +154,31 @@ async function insertFunding(tx: Tx, symbol: string, funding: FundingEvent[]): P
 export async function replaceDataset(
   symbol: string,
   interval: string,
-  last: Candle[],
-  mark: Candle[],
+  last: RawKline[],
+  mark: RawKline[],
   funding: FundingEvent[],
 ): Promise<void> {
+  const diag = process.env.NPRS_DIAG === '1';
+  const stamp = (what: string) => {
+    if (diag) console.log(`[diag] ${new Date().toISOString()} ${symbol} ${interval}: ${what}`);
+  };
+  stamp(`write start (${last.length} + ${mark.length} candles, ${funding.length} funding)`);
   await db.$transaction(
     async (tx) => {
       await tx.candle.deleteMany({ where: { symbol, interval } });
+      stamp('deleted old candles');
       await tx.fundingRate.deleteMany({ where: { symbol } });
       await insertCandles(tx, symbol, interval, 'last', last);
+      stamp('inserted execution candles');
       await insertCandles(tx, symbol, interval, 'mark', mark);
+      stamp('inserted mark candles');
       await insertFunding(tx, symbol, funding);
+      stamp('inserted funding, committing');
     },
     { timeout: 600_000, maxWait: 15_000 },
   );
+  bumpDatasetVersion();
+  stamp('committed');
 }
 
 /**
@@ -160,14 +203,6 @@ function joinMarkPrice(
   });
 }
 
-const toCandle = (r: RawKline): Candle => ({
-  t: r.openTime,
-  o: r.open,
-  h: r.high,
-  l: r.low,
-  c: r.close,
-  v: r.volume,
-});
 
 export async function startIngest(opts: {
   symbol: string; // 'ALL' or one of SYMBOLS
@@ -270,8 +305,8 @@ async function runJob(
       await replaceDataset(
         symbol,
         opts.interval,
-        last.map(toCandle),
-        mark.map(toCandle),
+        last,
+        mark,
         funding,
       );
       job.insertedCandles += last.length + mark.length;

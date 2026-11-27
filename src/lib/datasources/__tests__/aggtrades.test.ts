@@ -31,7 +31,7 @@ describe('parseAggTradesCsv', () => {
 });
 
 import { zipSync, strToU8 } from 'fflate';
-import { fastCsv, inflateFirstCsv } from '@/lib/datasources/aggtrades';
+import { csvBytes, inflateFirstCsv } from '@/lib/datasources/zip';
 
 describe('native zip reader', () => {
   const csv = `${HEADER}\n1,100,1,1,1,1000,true\n2,101,1,1,1,1001,false\n`;
@@ -40,7 +40,7 @@ describe('native zip reader', () => {
     for (const level of [0, 6] as const) {
       const zip = zipSync({ 'BTCUSDT-aggTrades-2025-01-01.csv': strToU8(csv) }, { level });
       expect(Buffer.from(inflateFirstCsv(zip) ?? new Uint8Array()).toString()).toBe(csv);
-      expect(Buffer.from(fastCsv(Buffer.from(zip))).toString()).toBe(csv);
+      expect(Buffer.from(csvBytes(zip)).toString()).toBe(csv);
     }
   });
 
