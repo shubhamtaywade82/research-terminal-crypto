@@ -30,6 +30,14 @@ describe('resolveDatabaseUrl', () => {
   });
 
   it('fails loudly when DATABASE_URL is missing', () => {
-    expect(() => resolveDatabaseUrl(undefined)).toThrow(/DATABASE_URL is not set/);
+    // Remove the variable for this assertion only, whatever the shell exported.
+    const savedUrl = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL;
+    try {
+      expect(() => resolveDatabaseUrl()).toThrow(/DATABASE_URL is not set/);
+    } finally {
+      if (savedUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = savedUrl;
+    }
   });
 });
