@@ -238,10 +238,18 @@ export default function Page() {
   const compareStrategies = useCallback(async () => {
     setComparing(true);
     try {
+      // Tick runs one strategy at a time, so the comparison uses refined mode when tick is
+      // selected (the same ordering where it matters, and it can compare all strategies).
+      const compareMode = params.intrabarMode === 'tick' ? 'refined' : (params.intrabarMode ?? 'bar');
       const res = await fetch('/api/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...params, mode: 'compare' }),
+        body: JSON.stringify({
+          ...params,
+          intrabarMode: compareMode,
+          mode: 'compare',
+          ...(windowBounds ? { windowFromMs: windowBounds.from, windowToMs: windowBounds.to } : {}),
+        }),
       });
       const data = (await res.json()) as {
         results?: CompareRow[];
@@ -259,8 +267,9 @@ export default function Page() {
       const best = [...data.results].sort(
         (a, b) => b.metrics.totalReturnPct - a.metrics.totalReturnPct,
       )[0];
+      const modeNote = params.intrabarMode === 'tick' ? ' (refined mode: tick runs one strategy at a time)' : '';
       toast({
-        title: `Compared ${data.results.length} strategies on ${params.symbol} ${params.interval}`,
+        title: `Compared ${data.results.length} strategies on ${params.symbol} ${params.interval}${modeNote}`,
         description: best
           ? `Best return: ${best.name} ${fmtSignedPct(best.metrics.totalReturnPct, 1)}`
           : undefined,
@@ -276,7 +285,7 @@ export default function Page() {
     } finally {
       setComparing(false);
     }
-  }, [params, refreshRuns, toast]);
+  }, [params, refreshRuns, toast, windowBounds]);
 
   const deleteRun = useCallback(
     async (id: string) => {
