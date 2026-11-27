@@ -31,7 +31,7 @@ import {
 import { Activity, Database, Loader2, Radio, TriangleAlert } from 'lucide-react';
 import { fmtDate, fmtPrice, fmtSignedPct } from '@/lib/format';
 import { SYMBOLS } from '@/lib/nprs/defaults';
-import { DatasetInfo, IngestJobState } from '@/lib/nprs/types';
+import { DatasetInfo, INTERVAL_MAX_YEARS, INTERVALS, Interval, IngestJobState } from '@/lib/nprs/types';
 
 export interface IngestRequest {
   symbol: string;
@@ -54,7 +54,6 @@ interface TickerRow {
   quoteVolumeUsd: number;
 }
 
-const INTERVALS = ['5m', '15m', '1h', '4h', '1d'];
 const YEAR_OPTIONS = [
   { value: '0.25', label: '3 months' },
   { value: '0.5', label: '6 months' },
@@ -209,7 +208,7 @@ export function DataPanel({ datasets, job, onIngest }: DataPanelProps) {
                 onValueChange={(v) => {
                   setIntervalChoice(v);
                   // keep the history selection valid for the new interval
-                  const maxYears = v === '5m' ? 0.25 : v === '15m' ? 1 : 5;
+                  const maxYears = INTERVAL_MAX_YEARS[v as Interval];
                   if (Number(years) > maxYears) setYears(String(maxYears));
                 }}
                 disabled={running}
@@ -233,11 +232,8 @@ export function DataPanel({ datasets, job, onIngest }: DataPanelProps) {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className="border-zinc-800 bg-zinc-900">
-                  {(interval === '5m'
-                    ? YEAR_OPTIONS.filter((y) => Number(y.value) <= 0.25)
-                    : interval === '15m'
-                      ? YEAR_OPTIONS.filter((y) => Number(y.value) <= 1)
-                      : YEAR_OPTIONS
+                  {YEAR_OPTIONS.filter(
+                    (y) => Number(y.value) <= INTERVAL_MAX_YEARS[interval as Interval],
                   ).map((y) => (
                     <SelectItem key={y.value} value={y.value} className="text-sm">
                       {y.label}

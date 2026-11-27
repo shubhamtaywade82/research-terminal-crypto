@@ -4,7 +4,7 @@ import { DEFAULT_PARAMS } from './defaults';
 import { getStrategy, STRATEGY_IDS } from './strategies';
 import { Interval, StrategyParams } from './types';
 
-const INTERVALS: Interval[] = ['5m', '15m', '1h', '4h', '1d'];
+import { INTERVALS } from './types';
 
 function num(v: unknown, fallback: number, min: number, max: number): number {
   const n = typeof v === 'number' ? v : Number(v);

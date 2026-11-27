@@ -4,9 +4,26 @@
 // Exchange-independent: nothing here knows about Binance.
 // ---------------------------------------------------------------------------
 
-export type Interval = '5m' | '15m' | '1h' | '4h' | '1d';
+export type Interval = '1m' | '5m' | '15m' | '1h' | '4h' | '1d';
+
+/** Every interval the engine and archive ingestion support, finest first. */
+export const INTERVALS: Interval[] = ['1m', '5m', '15m', '1h', '4h', '1d'];
+
+/**
+ * How far back ingestion may go per interval. Finer bars mean far more rows
+ * (1m = 525,600 bars per symbol-year), so the depth limit shrinks with the bar size.
+ */
+export const INTERVAL_MAX_YEARS: Record<Interval, number> = {
+  '1m': 0.5,
+  '5m': 0.25,
+  '15m': 1,
+  '1h': 5,
+  '4h': 5,
+  '1d': 5,
+};
 
 export const INTERVAL_MS: Record<Interval, number> = {
+  '1m': 60_000,
   '5m': 300_000,
   '15m': 900_000,
   '1h': 3_600_000,

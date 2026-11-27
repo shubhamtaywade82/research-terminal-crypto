@@ -234,3 +234,27 @@ describe('engine: no lookahead', () => {
     expect(before(b.trades)).toEqual(before(a.trades));
   });
 });
+
+describe('engine: sub-hourly bars', () => {
+  const M = 60_000;
+
+  it('times max-hold exits in real minutes on 1m bars', () => {
+    // Signal on bar 1 -> entry at bar 2 open. Max hold 1h = 60 bars, so the exit
+    // is at bar 62 close, stamped 63 minutes after the epoch-based t0.
+    mockSignals = ['FLAT', ...Array(89).fill('LONG')];
+    const candles = Array.from({ length: 90 }, (_, i) => ({
+      t: T0 + i * M,
+      o: 100,
+      h: 100.1,
+      l: 99.9,
+      c: 100,
+      v: 1,
+    }));
+    const res = runBacktest(candles, [], baseParams({ interval: '1m', maxHoldHours: 1 }));
+    const t = res.trades[0];
+    expect(t.exitReason).toBe('MAX_HOLD');
+    expect(t.closeTime).toBe(T0 + 63 * M);
+    expect(t.holdMinutes).toBeCloseTo(61, 6);
+  });
+});
+

@@ -1,15 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getJob, startIngest, SYMBOLS } from '@/lib/ingest';
-import { Interval } from '@/lib/nprs/types';
-
-const INTERVALS: Interval[] = ['5m', '15m', '1h', '4h', '1d'];
-
-/** Archive depth limits per interval (5m and 15m files are large). */
-function maxYearsFor(interval: Interval): number {
-  if (interval === '5m') return 0.25;
-  if (interval === '15m') return 1;
-  return 5;
-}
+import { INTERVAL_MAX_YEARS, INTERVALS, Interval } from '@/lib/nprs/types';
 
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
@@ -40,7 +31,7 @@ export async function POST(request: Request) {
   if (!Number.isFinite(requested) || requested <= 0) {
     return NextResponse.json({ message: 'years must be a positive number' }, { status: 400 });
   }
-  const clampedYears = Math.min(maxYearsFor(interval as Interval), Math.max(0.1, requested));
+  const clampedYears = Math.min(INTERVAL_MAX_YEARS[interval as Interval], Math.max(0.1, requested));
 
   const res = await startIngest({
     symbol: symbol as string,

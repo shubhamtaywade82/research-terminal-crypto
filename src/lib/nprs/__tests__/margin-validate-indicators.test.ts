@@ -79,6 +79,11 @@ describe('validate.sanitizeParams', () => {
     expect(p.signalParams).toEqual({ rsiPeriod: 100, rsiLongMin: 50, rsiShortMax: 50 });
   });
 
+  it('accepts the 1m interval and falls back to the default for unknown ones', () => {
+    expect(sanitizeParams({ interval: '1m' }).interval).toBe('1m');
+    expect(sanitizeParams({ interval: '2h' }).interval).toBe(DEFAULT_PARAMS.interval);
+  });
+
   it('normalises the symbol', () => {
     expect(sanitizeParams({ symbol: '  ethusdt ' }).symbol).toBe('ETHUSDT');
   });

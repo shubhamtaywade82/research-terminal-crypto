@@ -23,7 +23,7 @@ import {
   getStrategy,
   STRATEGIES,
 } from '@/lib/nprs/strategies';
-import { Interval, StrategyParams } from '@/lib/nprs/types';
+import { INTERVALS, Interval, StrategyParams } from '@/lib/nprs/types';
 
 interface ConfigFormProps {
   params: StrategyParams;
@@ -260,7 +260,7 @@ export function ConfigForm({ params, onChange, disabled }: ConfigFormProps) {
           <SelectField
             label="Signal timeframe"
             value={params.interval}
-            options={(['5m', '15m', '1h', '4h', '1d'] as Interval[]).map((i) => ({
+            options={INTERVALS.map((i: Interval) => ({
               value: i,
               label: i,
             }))}
