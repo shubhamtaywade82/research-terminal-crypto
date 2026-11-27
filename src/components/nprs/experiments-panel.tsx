@@ -141,7 +141,9 @@ export function ExperimentsPanel({ runs, loading, selectedId, onView, onDelete }
                           variant="ghost"
                           size="sm"
                           className="h-7 px-2 text-zinc-400 hover:bg-zinc-800 hover:text-rose-400"
-                          onClick={() => onDelete(r.id)}
+                          onClick={() => {
+                            if (window.confirm(`Delete experiment "${r.label}"? Its trades and equity curve are removed permanently.`)) onDelete(r.id);
+                          }}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </Button>

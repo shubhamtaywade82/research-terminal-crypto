@@ -4,6 +4,7 @@
 // grouped into research-relevant sections. The entry signal is selectable
 // from the strategy registry; per-strategy params render dynamically.
 
+import { useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -22,7 +23,7 @@ import {
   getStrategy,
   STRATEGIES,
 } from '@/lib/nprs/strategies';
-import { Interval, StrategyParams } from '@/lib/nprs/types';
+import { INTERVALS, Interval, StrategyParams } from '@/lib/nprs/types';
 
 interface ConfigFormProps {
   params: StrategyParams;
@@ -49,20 +50,43 @@ function NumField({
   hint?: string;
   disabled?: boolean;
 }) {
+  // Keep the raw text while typing so partial input ("", "2.", "25") is not
+  // clamped on every keystroke. The clamped value is committed on blur/Enter.
+  const [draft, setDraft] = useState(String(value));
+  const [synced, setSynced] = useState(value);
+  if (value !== synced) {
+    // The committed value changed from outside (preset, strategy switch):
+    // resync the draft during render instead of in an effect.
+    setSynced(value);
+    setDraft(String(value));
+  }
+
+  const commit = () => {
+    const parsed = Number(draft);
+    if (draft.trim() === '' || !Number.isFinite(parsed)) {
+      setDraft(String(value));
+      return;
+    }
+    const clamped = Math.min(max, Math.max(min, parsed));
+    setDraft(String(clamped));
+    if (clamped !== value) onChange(clamped);
+  };
+
   return (
     <div className="space-y-1">
       <Label className="text-xs text-zinc-400">{label}</Label>
       <Input
         type="number"
         className="h-8 border-zinc-800 bg-zinc-950 font-mono text-sm"
-        value={value}
+        value={draft}
         min={min}
         max={max}
         step={step}
         disabled={disabled}
-        onChange={(e) => {
-          const v = Number(e.target.value);
-          if (Number.isFinite(v)) onChange(Math.min(max, Math.max(min, v)));
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit();
         }}
       />
       {hint ? <p className="text-[10px] leading-snug text-zinc-600">{hint}</p> : null}
@@ -236,11 +260,22 @@ export function ConfigForm({ params, onChange, disabled }: ConfigFormProps) {
           <SelectField
             label="Signal timeframe"
             value={params.interval}
-            options={(['5m', '15m', '1h', '4h', '1d'] as Interval[]).map((i) => ({
+            options={INTERVALS.map((i: Interval) => ({
               value: i,
               label: i,
             }))}
             onChange={(v) => set({ interval: v as Interval })}
+            disabled={disabled}
+          />
+          <SelectField
+            label="Execution (intrabar order)"
+            value={params.intrabarMode ?? 'bar'}
+            options={[
+              { value: 'bar', label: 'OHLC bars (fast)' },
+              { value: 'refined', label: 'OHLC + aggTrades where needed' },
+              { value: 'tick', label: 'aggTrades ticks (needs a window)' },
+            ]}
+            onChange={(v) => set({ intrabarMode: v as StrategyParams['intrabarMode'] })}
             disabled={disabled}
           />
           <NumField

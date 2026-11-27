@@ -34,7 +34,7 @@ const reasonStyle: Record<string, string> = {
 };
 
 function ReasonBadge({ reason }: { reason: string }) {
-  const label = reason.replace('_', ' ');
+  const label = reason.replaceAll('_', ' ');
   return (
     <Badge variant="outline" className={cn('whitespace-nowrap text-[10px]', reasonStyle[reason] ?? reasonStyle.END_OF_DATA)}>
       {label}

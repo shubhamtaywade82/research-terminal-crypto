@@ -1,37 +1,49 @@
 import { NextResponse } from 'next/server';
 import { getJob, startIngest, SYMBOLS } from '@/lib/ingest';
-import { Interval } from '@/lib/nprs/types';
-
-const INTERVALS: Interval[] = ['5m', '15m', '1h', '4h', '1d'];
-
-function maxYearsFor(interval: string): number {
-  if (interval === '5m') return 0.25;
-  if (interval === '15m') return 1;
-  return 5;
-}
+import { INTERVAL_MAX_YEARS, INTERVALS, Interval } from '@/lib/nprs/types';
 
 export async function POST(request: Request) {
-  const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+  const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!body || typeof body !== 'object') {
+    return NextResponse.json({ message: 'Request body must be a JSON object' }, { status: 400 });
+  }
 
-  // All data now comes from real Binance public endpoints (USDT-M archive).
-  const symbol =
-    typeof body.symbol === 'string' &&
-    (body.symbol === 'ALL' || SYMBOLS.includes(body.symbol))
-      ? body.symbol
-      : 'ALL';
-  const interval: Interval =
-    typeof body.interval === 'string' && INTERVALS.includes(body.interval as Interval)
-      ? (body.interval as Interval)
-      : '1h';
-  const requested = Number(body.years);
-  const years = Math.min(
-    maxYearsFor(interval),
-    Math.max(0.1, Number.isFinite(requested) && requested > 0 ? requested : 3),
-  );
+  // Reject unknown values instead of silently substituting a default: a typo
+  // such as "BTCUSDTT" must not start a four-symbol download.
+  const symbol = body.symbol ?? 'ALL';
+  if (symbol !== 'ALL' && !(typeof symbol === 'string' && SYMBOLS.includes(symbol))) {
+    return NextResponse.json(
+      { message: `symbol must be ALL or one of ${SYMBOLS.join(', ')}` },
+      { status: 400 },
+    );
+  }
 
-  const res = await startIngest({ symbol, interval, years });
+  const interval = body.interval ?? '1h';
+  if (!(typeof interval === 'string' && INTERVALS.includes(interval as Interval))) {
+    return NextResponse.json(
+      { message: `interval must be one of ${INTERVALS.join(', ')}` },
+      { status: 400 },
+    );
+  }
+
+  const years = body.years ?? 3;
+  const requested = typeof years === 'number' ? years : Number(years);
+  if (!Number.isFinite(requested) || requested <= 0) {
+    return NextResponse.json({ message: 'years must be a positive number' }, { status: 400 });
+  }
+  const clampedYears = Math.min(INTERVAL_MAX_YEARS[interval as Interval], Math.max(0.1, requested));
+
+  const res = await startIngest({
+    symbol: symbol as string,
+    interval: interval as Interval,
+    years: clampedYears,
+  });
   if (!res.started) {
     return NextResponse.json({ message: res.message, job: getJob() }, { status: 409 });
   }
-  return NextResponse.json({ message: res.message, job: getJob() });
+  return NextResponse.json({
+    message: res.message,
+    job: getJob(),
+    effectiveYears: clampedYears,
+  });
 }

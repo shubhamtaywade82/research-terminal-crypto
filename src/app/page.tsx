@@ -25,7 +25,7 @@ import { TradesTable } from '@/components/nprs/trades-table';
 import ResearchPanel from '@/components/nprs/research-panel';
 import { fmtPct, fmtSignedPct, fmtUsd } from '@/lib/format';
 import { DEFAULT_PARAMS, PRESETS } from '@/lib/nprs/defaults';
-import { getStrategy } from '@/lib/nprs/strategies';
+import { getStrategy, STRATEGIES } from '@/lib/nprs/strategies';
 import {
   CompareRow,
   DatasetInfo,
@@ -35,10 +35,33 @@ import {
   StrategyParams,
 } from '@/lib/nprs/types';
 
+type StatusPayload = { job: IngestJobState; datasets: DatasetInfo[] };
+
+/** Pure fetchers: return data (or null on failure) and never touch React state. */
+async function fetchStatusPayload(): Promise<StatusPayload | null> {
+  try {
+    const res = await fetch('/api/data/status');
+    return res.ok ? ((await res.json()) as StatusPayload) : null;
+  } catch {
+    return null; // server momentarily unavailable; keep previous state
+  }
+}
+
+async function fetchRunsPayload(): Promise<RunSummary[] | null> {
+  try {
+    const res = await fetch('/api/backtest');
+    if (!res.ok) return null;
+    return ((await res.json()) as { runs: RunSummary[] }).runs;
+  } catch {
+    return null;
+  }
+}
+
 export default function Page() {
   const { toast } = useToast();
 
-  const [params, setParams] = useState<StrategyParams>(DEFAULT_PARAMS);
+  // Tick is the default execution: exact order for fills, take-profit, liquidation and exits.
+  const [params, setParams] = useState<StrategyParams>({ ...DEFAULT_PARAMS, intrabarMode: 'tick' });
   const [label, setLabel] = useState('');
   const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
   const [job, setJob] = useState<IngestJobState | null>(null);
@@ -50,36 +73,63 @@ export default function Page() {
   const [comparing, setComparing] = useState(false);
   const [compareRows, setCompareRows] = useState<CompareRow[] | null>(null);
   const [tab, setTab] = useState('run');
+  // UTC window (YYYY-MM-DD, end exclusive). Defaults to the last ten complete days of
+  // the selected dataset, so tick runs work without typing dates; typed values win.
+  const [windowFromOverride, setWindowFromOverride] = useState<string | null>(null);
+  const [windowToOverride, setWindowToOverride] = useState<string | null>(null);
+  const DAY_MS = 86_400_000;
+  const selectedDataset = datasets.find((d) => d.symbol === params.symbol && d.interval === params.interval);
+  // Start of the UTC day holding the last stored bar: that day is partial, so excluded.
+  const defaultEnd = selectedDataset?.to != null ? Math.floor(selectedDataset.to / DAY_MS) * DAY_MS : null;
+  const toDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  const windowFrom = windowFromOverride ?? (defaultEnd !== null ? toDay(defaultEnd - 10 * DAY_MS) : '');
+  const windowTo = windowToOverride ?? (defaultEnd !== null ? toDay(defaultEnd) : '');
+  const setWindowFrom = (v: string) => setWindowFromOverride(v);
+  const setWindowTo = (v: string) => setWindowToOverride(v);
+  const windowMs = (day: string) => {
+    const t = Date.parse(`${day}T00:00:00Z`);
+    return Number.isFinite(t) ? t : null;
+  };
+  const windowBounds = (() => {
+    const from = windowFrom ? windowMs(windowFrom) : null;
+    const to = windowTo ? windowMs(windowTo) : null;
+    return from !== null && to !== null && to > from ? { from, to } : null;
+  })();
+  const needsWindow = params.intrabarMode === 'tick' && windowBounds === null;
 
   const refreshStatus = useCallback(async () => {
-    try {
-      const res = await fetch('/api/data/status');
-      if (!res.ok) return;
-      const data = (await res.json()) as { job: IngestJobState; datasets: DatasetInfo[] };
+    const data = await fetchStatusPayload();
+    if (data) {
       setJob(data.job);
       setDatasets(data.datasets);
-    } catch {
-      // server momentarily unavailable; keep previous state
     }
   }, []);
 
   const refreshRuns = useCallback(async () => {
-    try {
-      const res = await fetch('/api/backtest');
-      if (!res.ok) return;
-      const data = (await res.json()) as { runs: RunSummary[] };
-      setRuns(data.runs);
-    } catch {
-      // ignore
-    } finally {
-      setRunsLoading(false);
-    }
+    const list = await fetchRunsPayload();
+    if (list) setRuns(list);
+    setRunsLoading(false);
   }, []);
 
+  // Initial load. State is only set inside promise callbacks, and the cleanup
+  // ignores responses that arrive after unmount.
   useEffect(() => {
-    void refreshStatus();
-    void refreshRuns();
-  }, [refreshStatus, refreshRuns]);
+    let active = true;
+    void fetchStatusPayload().then((data) => {
+      if (active && data) {
+        setJob(data.job);
+        setDatasets(data.datasets);
+      }
+    });
+    void fetchRunsPayload().then((list) => {
+      if (!active) return;
+      if (list) setRuns(list);
+      setRunsLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!job?.running) return;
@@ -147,7 +197,11 @@ export default function Page() {
       const res = await fetch('/api/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...params, label: label.trim() || undefined }),
+        body: JSON.stringify({
+          ...params,
+          label: label.trim() || undefined,
+          ...(windowBounds ? { windowFromMs: windowBounds.from, windowToMs: windowBounds.to } : {}),
+        }),
       });
       const data = (await res.json()) as {
         id?: string;
@@ -179,15 +233,23 @@ export default function Page() {
     } finally {
       setRunning(false);
     }
-  }, [label, loadDetail, params, refreshRuns, toast]);
+  }, [label, loadDetail, params, refreshRuns, toast, windowBounds]);
 
   const compareStrategies = useCallback(async () => {
     setComparing(true);
     try {
+      // Tick runs one strategy at a time, so the comparison uses refined mode when tick is
+      // selected (the same ordering where it matters, and it can compare all strategies).
+      const compareMode = params.intrabarMode === 'tick' ? 'refined' : (params.intrabarMode ?? 'bar');
       const res = await fetch('/api/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...params, mode: 'compare' }),
+        body: JSON.stringify({
+          ...params,
+          intrabarMode: compareMode,
+          mode: 'compare',
+          ...(windowBounds ? { windowFromMs: windowBounds.from, windowToMs: windowBounds.to } : {}),
+        }),
       });
       const data = (await res.json()) as {
         results?: CompareRow[];
@@ -205,8 +267,9 @@ export default function Page() {
       const best = [...data.results].sort(
         (a, b) => b.metrics.totalReturnPct - a.metrics.totalReturnPct,
       )[0];
+      const modeNote = params.intrabarMode === 'tick' ? ' (refined mode: tick runs one strategy at a time)' : '';
       toast({
-        title: `Compared ${data.results.length} strategies on ${params.symbol} ${params.interval}`,
+        title: `Compared ${data.results.length} strategies on ${params.symbol} ${params.interval}${modeNote}`,
         description: best
           ? `Best return: ${best.name} ${fmtSignedPct(best.metrics.totalReturnPct, 1)}`
           : undefined,
@@ -222,14 +285,16 @@ export default function Page() {
     } finally {
       setComparing(false);
     }
-  }, [params, refreshRuns, toast]);
+  }, [params, refreshRuns, toast, windowBounds]);
 
   const deleteRun = useCallback(
     async (id: string) => {
       try {
-        await fetch(`/api/backtest/${id}`, { method: 'DELETE' });
+        const res = await fetch(`/api/backtest/${id}`, { method: 'DELETE' });
+        // 404 means it is already gone server-side, so drop it locally too.
+        if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
         setRuns((rs) => rs.filter((r) => r.id !== id));
-        if (detail?.id === id) setDetail(null);
+        setDetail((d) => (d?.id === id ? null : d));
         toast({ title: 'Experiment deleted' });
       } catch {
         toast({
@@ -239,7 +304,7 @@ export default function Page() {
         });
       }
     },
-    [detail?.id, toast],
+    [toast],
   );
 
   const applyPreset = useCallback(
@@ -251,6 +316,7 @@ export default function Page() {
         ...preset.patch,
         symbol: prev.symbol,
         interval: prev.interval,
+        intrabarMode: prev.intrabarMode,
         startingEquity: prev.startingEquity,
         strategyId: prev.strategyId,
         signalParams: prev.signalParams,
@@ -343,6 +409,33 @@ export default function Page() {
                 <ConfigForm params={params} onChange={setParams} disabled={running} />
 
                 <div className="space-y-2 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-1">
+                      <Label className="text-xs text-zinc-400">Window from (UTC)</Label>
+                      <Input
+                        type="date"
+                        className="h-8 border-zinc-800 bg-zinc-950 font-mono text-sm"
+                        value={windowFrom}
+                        onChange={(e) => setWindowFrom(e.target.value)}
+                        disabled={running}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-xs text-zinc-400">Window to (exclusive)</Label>
+                      <Input
+                        type="date"
+                        className="h-8 border-zinc-800 bg-zinc-950 font-mono text-sm"
+                        value={windowTo}
+                        onChange={(e) => setWindowTo(e.target.value)}
+                        disabled={running}
+                      />
+                    </div>
+                  </div>
+                  <p className="text-[11px] leading-snug text-zinc-500">
+                    Defaults to the last ten complete days of the selected dataset. Tick runs up to 366 days.
+                    Days not cached yet are downloaded at a paced rate, at most 60 per request; cached
+                    days are free, so long windows fill up over several runs.
+                  </p>
                   <Label className="text-xs text-zinc-400">Experiment label (optional)</Label>
                   <Input
                     className="h-8 border-zinc-800 bg-zinc-950 font-mono text-sm"
@@ -353,7 +446,7 @@ export default function Page() {
                   />
                   <Button
                     className="w-full bg-emerald-600 font-semibold text-zinc-950 hover:bg-emerald-500"
-                    disabled={running || comparing || job?.running === true}
+                    disabled={running || comparing || job?.running === true || needsWindow}
                     onClick={() => void runBacktest()}
                   >
                     {running ? (
@@ -377,7 +470,7 @@ export default function Page() {
                     {comparing ? (
                       <>
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        Comparing 8 strategies...
+                        Comparing {STRATEGIES.length} strategies...
                       </>
                     ) : (
                       <>

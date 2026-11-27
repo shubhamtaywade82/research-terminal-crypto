@@ -4,7 +4,7 @@ import { DEFAULT_PARAMS } from './defaults';
 import { getStrategy, STRATEGY_IDS } from './strategies';
 import { Interval, StrategyParams } from './types';
 
-const INTERVALS: Interval[] = ['5m', '15m', '1h', '4h', '1d'];
+import { INTERVALS } from './types';
 
 function num(v: unknown, fallback: number, min: number, max: number): number {
   const n = typeof v === 'number' ? v : Number(v);
@@ -72,6 +72,7 @@ export function sanitizeParams(raw: unknown): StrategyParams {
         ? r.symbol.trim().toUpperCase().slice(0, 20)
         : d.symbol,
     interval: pick<Interval>(r.interval, INTERVALS, d.interval),
+    intrabarMode: pick(r.intrabarMode, ['bar', 'refined', 'tick'] as const, d.intrabarMode ?? 'bar'),
     startingEquity: num(r.startingEquity, d.startingEquity, 100, 10_000_000),
     initialAllocPct: num(r.initialAllocPct, d.initialAllocPct, 0.1, 100),
     leverage: num(r.leverage, d.leverage, 1, 125),
