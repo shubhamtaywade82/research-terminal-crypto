@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { strToU8, zipSync } from 'fflate';
 import type * as BinanceModule from '@/lib/datasources/binance';
+import { stopDecodeWorker } from '@/lib/datasources/decode-pool';
 
 // The archive client caches under NPRS_ROOT/.cache, so point it at a temp dir
 // before the module loads. fetch is mocked: no network in these tests.
@@ -51,6 +52,8 @@ beforeAll(() => {
   binance = require('@/lib/datasources/binance') as typeof BinanceModule;
 });
 
+afterAll(() => stopDecodeWorker());
+
 beforeEach(() => {
   routes = {};
   fs.rmSync(path.join(root, '.cache'), { recursive: true, force: true });
@@ -84,9 +87,9 @@ describe('fetchFuturesKlines', () => {
       onFile: (file, status) => events.push(`${status}:${file}`),
     });
 
-    expect(rows).toHaveLength(31 * 24 + 28 * 24);
-    const gaps = rows.slice(1).filter((r, i) => r.openTime - rows[i].openTime !== H);
-    expect(gaps).toHaveLength(0);
+    const times = Array.from(rows.t);
+    expect(times).toHaveLength(31 * 24 + 28 * 24);
+    expect(times.slice(1).filter((x, i) => x - times[i] !== H)).toHaveLength(0);
     expect(events.some((e) => e.startsWith('healed:'))).toBe(true);
   });
 
@@ -99,7 +102,7 @@ describe('fetchFuturesKlines', () => {
     const rows = await binance.fetchFuturesKlines('BTCUSDT', '1h', JAN, FEB_END, 'last', {
       onFile: (file, status) => events.push(`${status}:${file}`),
     });
-    expect(rows).toHaveLength(28 * 24);
+    expect(rows.t.length).toBe(28 * 24);
     expect(events).toContain('missing:BTCUSDT-1h-2025-01.zip');
   });
 
@@ -110,12 +113,28 @@ describe('fetchFuturesKlines', () => {
     ];
     routes[monthlyKlines('2025-02')] = [{ status: 404 }];
     const rows = await binance.fetchFuturesKlines('BTCUSDT', '1h', JAN, FEB_END);
-    expect(rows).toHaveLength(31 * 24);
+    expect(rows.t.length).toBe(31 * 24);
     const janCalls = (global.fetch as jest.Mock).mock.calls.filter(
       ([u]) => String(u).endsWith(monthlyKlines('2025-01')),
     );
     expect(janCalls).toHaveLength(2);
   }, 15_000);
+
+  it('re-fetches a cached copy that no longer decodes, then uses the fresh copy', async () => {
+    const cachePath = path.join(root, '.cache', 'binance', monthlyKlines('2025-01').replace(/^\//, ''));
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    fs.writeFileSync(cachePath, 'corrupt cache bytes, not a zip');
+    routes[monthlyKlines('2025-01')] = [
+      { status: 200, body: zipOf(klineCsv(JAN, Date.UTC(2025, 1, 1))) },
+    ];
+    routes[monthlyKlines('2025-02')] = [{ status: 404 }];
+    const rows = await binance.fetchFuturesKlines('BTCUSDT', '1h', JAN, FEB_END);
+    expect(rows.t.length).toBe(31 * 24);
+    const janCalls = (global.fetch as jest.Mock).mock.calls.filter(
+      ([u]) => String(u).endsWith(monthlyKlines('2025-01')),
+    );
+    expect(janCalls).toHaveLength(1);
+  });
 
   it('gives up after the retry budget on persistent network errors', async () => {
     routes[monthlyKlines('2025-01')] = ['reject'];
@@ -155,7 +174,7 @@ describe('fetchFundingHistory', () => {
       { status: 200, body: zipOf(csv) },
     ];
     const rows = await binance.fetchFundingHistory('BTCUSDT', JAN, Date.UTC(2025, 0, 31, 23));
-    expect(rows.map((r) => r.fundingTime)).toEqual([JAN, JAN + 8 * H]);
-    expect(rows.map((r) => r.rate)).toEqual([0.0001, -0.0002]);
+    expect(Array.from(rows.t)).toEqual([JAN, JAN + 8 * H]);
+    expect(Array.from(rows.rate)).toEqual([0.0001, -0.0002]);
   });
 });

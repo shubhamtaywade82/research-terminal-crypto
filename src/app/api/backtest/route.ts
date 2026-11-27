@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { dbRead } from '@/lib/db-read';
 import {
   runBacktest,
   runRefinedBacktest,
@@ -421,7 +420,7 @@ export async function POST(request: Request) {
 }
 
 export async function GET() {
-  const runs = await dbRead.backtestRun.findMany({
+  const runs = await db.backtestRun.findMany({
     orderBy: { createdAt: 'desc' },
     take: 100,
   });

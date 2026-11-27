@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { dbRead } from '@/lib/db-read';
 import {
   BacktestMetrics,
   EquitySeriesPoint,
@@ -16,7 +15,7 @@ export async function GET(
 ) {
   const { id } = await context.params;
 
-  const run = await dbRead.backtestRun.findUnique({
+  const run = await db.backtestRun.findUnique({
     where: { id },
     include: {
       trades: { orderBy: { seq: 'asc' } },
@@ -28,7 +27,7 @@ export async function GET(
     return NextResponse.json({ message: 'Run not found' }, { status: 404 });
   }
 
-  const candles = await dbRead.candle.findMany({
+  const candles = await db.candle.findMany({
     where: {
       symbol: run.symbol,
       interval: run.interval,

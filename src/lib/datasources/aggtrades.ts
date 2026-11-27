@@ -4,52 +4,17 @@
 //
 // Only trade price and transact_time feed the simulator; quantities are not needed
 // for fills, take-profit or excursions. Days are cached on disk as zips (via the
-// shared archive client) and decoded into typed arrays, with a small LRU in memory:
-// a backtest walks days in order, so each day is decoded once per run.
+// shared archive client), decoded in the worker thread into typed arrays, and kept
+// in a small LRU: a backtest walks days in order, so each day is decoded once per run.
 
-import { csvBytes, yieldToEventLoop } from './zip';
 import { access } from 'node:fs/promises';
 import { archiveCachePath, ArchiveNotFound, assertArchiveArgs, fetchArchiveZip } from './binance';
+import { decodeAggTradesZip, TradeSeries } from './decode-pool';
 import { RequestBudget } from '@/lib/net/throttle';
 import { DEFAULT_DOWNLOADS_PER_REQUEST } from '@/lib/net/hosts';
 import type { IntrabarSource, IntrabarWindow } from '@/lib/nprs/types';
 
 const DAY_MS = 86_400_000;
-
-/** Parse an aggTrades CSV into time-ordered (t, p) arrays. Malformed rows are skipped. */
-export function parseAggTradesCsv(text: string): IntrabarWindow {
-  const lines = text.split('\n');
-  const t: number[] = [];
-  const p: number[] = [];
-  for (let li = 0; li < lines.length; li++) {
-    const line = lines[li];
-    if (!line) continue;
-    if (li === 0 && line.startsWith('agg_trade_id')) continue; // header
-    const f = line.split(',');
-    const price = Number(f[1]);
-    const time = Number(f[5]);
-    if (!Number.isFinite(price) || !Number.isFinite(time) || price <= 0) continue;
-    t.push(time);
-    p.push(price);
-  }
-
-  // The archive is time-ordered; verify rather than assume, and sort stably if not.
-  let sorted = true;
-  for (let i = 1; i < t.length; i++) {
-    if (t[i] < t[i - 1]) {
-      sorted = false;
-      break;
-    }
-  }
-  if (!sorted) {
-    const order = t.map((_, i) => i).sort((a, b) => t[a] - t[b] || a - b);
-    return {
-      t: Float64Array.from(order, (i) => t[i]),
-      p: Float64Array.from(order, (i) => p[i]),
-    };
-  }
-  return { t: Float64Array.from(t), p: Float64Array.from(p) };
-}
 
 /** Day keys in [fromMs, toMs) whose aggTrades zip is NOT yet in the local cache. */
 export async function uncachedAggTradeDays(symbol: string, fromMs: number, toMs: number): Promise<string[]> {
@@ -146,20 +111,17 @@ export function createAggTradeSource(symbol: string, opts: AggTradeSourceOptions
       days.set(key, cached);
       return cached;
     }
-    let day: IntrabarWindow | null;
+    let day: TradeSeries | null;
     try {
       const archivePath = `/data/futures/um/daily/aggTrades/${symbol}/${symbol}-aggTrades-${key}.zip`;
-      // One unzip per day: the cache is not pre-validated; a corrupt copy is re-fetched.
-      let { buf } = await fetchArchiveZip(archivePath, { validateCache: false, budget });
-      let csv: Uint8Array;
+      const first = await fetchArchiveZip(archivePath, { budget });
       try {
-        csv = csvBytes(new Uint8Array(buf));
+        day = await decodeAggTradesZip(first.buf);
       } catch {
-        ({ buf } = await fetchArchiveZip(archivePath, { force: true, budget }));
-        csv = csvBytes(new Uint8Array(buf));
+        // A cached copy that no longer decodes is re-fetched once (budget applies again).
+        const again = await fetchArchiveZip(archivePath, { force: true, budget });
+        day = await decodeAggTradesZip(again.buf);
       }
-      await yieldToEventLoop();
-      day = parseAggTradesCsv(new TextDecoder().decode(csv));
       stats.daysLoaded += 1;
     } catch (e) {
       if (!(e instanceof ArchiveNotFound)) throw e;

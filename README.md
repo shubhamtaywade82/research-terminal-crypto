@@ -151,26 +151,51 @@ spot request.
 
 ## Operations: responsiveness, memory and diagnostics
 
-Large ingests (a 1m series is about 261k candles per symbol per six months) used to freeze the
-server for up to a minute during the write. What changed:
+A large ingest (a 1m series is about 261k candles per symbol per six months) used to freeze the
+server: the write ran on the server thread and the whole archive was parsed there too. Three
+things now run off the server thread:
 
-- **Writes are multi-row raw INSERTs** (500 rows per statement, values bound as parameters),
-  inside the same transaction as the delete, so a dataset is still replaced atomically. The
-  previous Prisma `createMany` path cost about 130 ms of CPU per 1,000 rows.
-- **The ingest yields to the event loop** between downloaded files and insert batches.
-- **Archive files are inflated once**, with Node's native zlib (`src/lib/datasources/zip.ts`).
-- **SQLite runs in WAL mode** with a busy timeout. Read-only routes (status, run list, run
-  detail) use a separate read connection, so they do not queue behind a write.
-- **Dataset coverage is cached** until a dataset write commits, so polling does not re-aggregate
-  millions of rows.
+- **Archive decoding** (`src/lib/datasources/decode-worker.ts`, `decode-pool.ts`). Zip inflate,
+  CSV parse, sort, de-duplicate, merge and gap scans run in one worker thread. Results come back
+  as typed arrays (`KlineSeries`, `FundingSeries`, `TradeSeries`), transferred without copies.
+  A cached file that no longer decodes is re-downloaded once.
+- **Dataset writes** (`src/lib/store/store-worker.ts`, `store-pool.ts`). The replace (delete the
+  old rows, insert the new ones, commit) runs in one write transaction on the worker's own
+  SQLite connection. Each chunk of 20,000 rows is one statement that binds a JSON array and
+  unpacks it with `json_each`. Binding nine values per row grew native memory by about 1 KB per
+  row, so the JSON shape is what keeps the peak down. A failure anywhere rolls the whole replace
+  back; the previous dataset stays intact (tested against a real SQLite file).
+- **Dataset coverage** (the aggregate behind `/api/data/status`) runs on the same worker, on its
+  own connection, and is cached until a write commits. Polls never aggregate on the server thread.
 
-Measured on a four-symbol 1m ingest (39 s, 33 status and static probes, all HTTP 200): status
-median 19 ms (p95 501 ms; it was about 430 ms idle before the cache), peak server memory 587 MB
-(it was 1.48 GB), worst event-loop block about 0.9 s (it was 62.6 s). The stored rows match the
-archive: row counts, first and last timestamps, OHLCV sums and funding all agree.
+SQLite runs in WAL mode with a busy timeout, so reads from the shared Prisma client proceed while a
+write transaction is open.
+
+Measured on this container (cold start, `NPRS_DIAG=1`, 6-month 1m ingest; the status probe polls
+every second during the run and every response was HTTP 200):
+
+| Ingest | Rows | Worst event-loop window | Peak RSS (fresh process) | Status p50 / p95 |
+|---|---|---|---|---|
+| SOLUSDT 1m | 522k candles + 469 funding | 111 ms | 228 MB (idle 94 MB) | 16 / 17 ms |
+| ALL (4 symbols) 1m | 2.09 M candles + 1,876 funding | 68 ms | 358 MB (idle 94 MB) | 14 / 535 ms |
+
+No event-loop block above the 150 ms logging threshold occurred in either run. The 535 ms status
+p95 is the coverage aggregate awaited on the worker right after a commit (about 0.5 s for two
+million rows); it does not block the server thread. Before this work the same kind of ingest froze
+the server for up to 62 s and peaked near 1.5 GB.
+
+The stored rows match the archive: row counts, first and last timestamps, OHLCV sums and funding
+all agree.
+
+**Read connection.** The app used to run a second Prisma client for read routes. It was removed:
+the ingest no longer holds the shared client on the server thread, and an A/B during an ingest
+(`GET /api/backtest`, 90 samples per variant) showed no latency difference (p50 15 ms both ways,
+p95 19 ms vs 21 ms) and no meaningful memory difference.
 
 **Diagnostics.** Start the server with `NPRS_DIAG=1` to log event-loop blocks above 150 ms with
-timestamps, the worst block per 10 seconds, and the phases of each ingest write.
+timestamps, the worst window per 10 seconds, and each stage of an ingest write with the server's
+RSS, JS heap and buffer memory. Memory of the worker threads is part of RSS but not of the
+per-stage heap figures, so compare RSS between stages, not heap alone.
 
 ## Architecture
 
@@ -186,10 +211,20 @@ src/
       backtest/[id]/          # full run detail (trades, equity, risk events)
   components/nprs/            # config form, data panel, results, trades table, charts, lab
   lib/
-    datasources/binance.ts    # real HTTP client: archive zips, gap healing, retries, cache
+    datasources/binance.ts    # real HTTP client: archive files, gap healing, retries, cache
+    datasources/decode-worker.ts  # worker: zip inflate, CSV decode, sort, merge, gap scan
+    datasources/decode-pool.ts    # main-thread API for the decode worker (typed arrays)
+    datasources/aggtrades.ts      # tick data: daily aggTrades days with an LRU and a budget
+    datasources/event-loop.ts     # yieldToEventLoop()
+    store/store-worker.ts     # worker: dataset replace (one transaction) and coverage queries
+    store/store-pool.ts       # main-thread API for the store worker
     ingest.ts                 # background ingestion job manager
+    net/throttle.ts, hosts.ts # per-host rate gate, cooldowns, request budget
+    diagnostics/lag-monitor.ts # NPRS_DIAG=1 event-loop lag monitor
     nprs/
-      engine.ts               # deterministic event-driven backtest engine
+      engine.ts               # deterministic bar engine (bar / refined modes)
+      tick-engine.ts          # event-driven tick engine over aggTrades prints
+      simulator.ts            # position, fills, funding and risk state shared by both engines
       margin.ts               # isolated-margin liquidation & risk-state math
       indicators.ts           # EMA/ATR/RSI/MACD/Donchian/Bollinger/ROC/Supertrend
       strategies.ts           # strategy registry (8 signal families)

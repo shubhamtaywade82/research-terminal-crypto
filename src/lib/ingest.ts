@@ -7,22 +7,31 @@
 //   - mark price klines (kind 'mark') : the series liquidation runs on
 //   - funding rates                   : real settled rates, mark price joined
 //
+// Series travel as typed arrays (KlineSeries / FundingSeries) from the decode worker to the
+// write, and rows are built per INSERT batch, so a large ingest never holds one JS object
+// per candle.
+//
 // Every archive file is cached on disk, so re-ingests only download new files.
 
-import type { Prisma } from '@prisma/client';
-import { db } from '@/lib/db';
 import {
   ArchiveEvents,
   fetchFundingHistory,
   fetchFuturesKlines,
 } from '@/lib/datasources/binance';
-import { RawKline } from '@/lib/nprs/types';
-import { yieldToEventLoop } from '@/lib/datasources/zip';
+import type { FundingSeries, KlineSeries } from '@/lib/datasources/decode-pool';
 import { bumpDatasetVersion } from '@/lib/datasets-version';
-import { Candle, FundingEvent, IngestJobState, Interval } from '@/lib/nprs/types';
+import { writeDataset } from '@/lib/store/store-pool';
+import { IngestJobState, Interval } from '@/lib/nprs/types';
 
 export const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'];
 export const DATA_SOURCE_LABEL = 'Binance USDT-M public archive (data.binance.vision)';
+
+/** Funding events with the mark price joined in, as parallel arrays. */
+export interface FundingJoined {
+  t: Float64Array;
+  rate: Float64Array;
+  markPrice: Float64Array;
+}
 
 const g = globalThis as unknown as { __nprsIngestJob?: IngestJobState };
 
@@ -74,135 +83,56 @@ function archiveEvents(job: IngestJobState, kindLabel: string): ArchiveEvents {
   };
 }
 
-export type Tx = Prisma.TransactionClient;
-
-const CHUNK = 1000;
-
 /**
- * Rows per multi-row INSERT. Values are bound as parameters (never interpolated), and
- * 500 rows x 9 columns stays under SQLite's bind-parameter limit.
+ * Replace one symbol/interval dataset ATOMICALLY, in the store writer thread: the old candles
+ * (both kinds) and funding rows are deleted and the fresh ones inserted in one transaction.
+ * A failure anywhere rolls the whole replace back, so the store never holds a mix of new
+ * candles with stale funding (or a half-written series).
+ *
+ * The series are transferred to the writer, so they are detached after this call: read
+ * their lengths before calling.
  */
-const INSERT_ROWS = 500;
-
-/**
- * Multi-row INSERT through the transaction's raw driver. About ten times cheaper than
- * Prisma createMany for the same rows, and it keeps the batch's CPU work short, so the
- * server stays responsive during a large write. DateTime values use the same ISO text
- * form the Prisma client writes, so rows read back identically.
- */
-async function insertRows(
-  tx: Tx,
-  table: string,
-  columns: string[],
-  rows: unknown[][],
-): Promise<void> {
-  const cols = columns.join(', ');
-  const width = columns.length;
-  const one = `(${Array(width).fill('?').join(', ')})`;
-  for (let i = 0; i < rows.length; i += INSERT_ROWS) {
-    const batch = rows.slice(i, i + INSERT_ROWS);
-    const params: unknown[] = [];
-    for (const r of batch) params.push(...r);
-    await tx.$executeRawUnsafe(
-      `INSERT INTO ${table} (${cols}) VALUES ${batch.map(() => one).join(', ')}`,
-      ...params,
-    );
-    await yieldToEventLoop();
-  }
+/** Diagnostic memory note (NPRS_DIAG=1): process RSS, JS heap and external buffers, in MB. */
+export function memNote(): string {
+  const m = process.memoryUsage();
+  const mb = (n: number) => Math.round(n / 1048576);
+  return `rss ${mb(m.rss)} MB, heap ${mb(m.heapUsed)} MB, buffers ${mb(m.arrayBuffers)} MB`;
 }
 
-export async function insertCandles(
-  tx: Tx,
-  symbol: string,
-  interval: string,
-  kind: 'last' | 'mark',
-  candles: RawKline[],
-): Promise<void> {
-  await insertRows(
-    tx,
-    'Candle',
-    ['symbol', 'interval', 'kind', 'openTime', 'open', 'high', 'low', 'close', 'volume'],
-    candles.map((c) => [
-      symbol,
-      interval,
-      kind,
-      new Date(c.openTime).toISOString(),
-      c.open,
-      c.high,
-      c.low,
-      c.close,
-      c.volume,
-    ]),
-  );
-}
-
-export async function insertFunding(tx: Tx, symbol: string, funding: FundingEvent[]): Promise<void> {
-  await insertRows(
-    tx,
-    'FundingRate',
-    ['symbol', 'fundingTime', 'rate', 'markPrice'],
-    funding.map((f) => [symbol, new Date(f.t).toISOString(), f.rate, f.markPrice]),
-  );
-}
-
-/**
- * Replace one symbol/interval dataset ATOMICALLY: the old candles (both kinds)
- * and funding rows are deleted and the fresh ones inserted in one transaction.
- * A failure anywhere rolls the whole replace back, so the store never holds a
- * mix of new candles with stale funding (or a half-written series).
- */
 export async function replaceDataset(
   symbol: string,
   interval: string,
-  last: RawKline[],
-  mark: RawKline[],
-  funding: FundingEvent[],
+  last: KlineSeries,
+  mark: KlineSeries,
+  funding: FundingJoined,
 ): Promise<void> {
   const diag = process.env.NPRS_DIAG === '1';
   const stamp = (what: string) => {
     if (diag) console.log(`[diag] ${new Date().toISOString()} ${symbol} ${interval}: ${what}`);
   };
-  stamp(`write start (${last.length} + ${mark.length} candles, ${funding.length} funding)`);
-  await db.$transaction(
-    async (tx) => {
-      await tx.candle.deleteMany({ where: { symbol, interval } });
-      stamp('deleted old candles');
-      await tx.fundingRate.deleteMany({ where: { symbol } });
-      await insertCandles(tx, symbol, interval, 'last', last);
-      stamp('inserted execution candles');
-      await insertCandles(tx, symbol, interval, 'mark', mark);
-      stamp('inserted mark candles');
-      await insertFunding(tx, symbol, funding);
-      stamp('inserted funding, committing');
-    },
-    { timeout: 600_000, maxWait: 15_000 },
-  );
+  stamp(`write start (${last.t.length} + ${mark.t.length} candles, ${funding.t.length} funding; ${memNote()})`);
+  await writeDataset({ symbol, interval, last, mark, funding, onStage: stamp });
   bumpDatasetVersion();
-  stamp('committed');
+  stamp(`committed (${memNote()})`);
 }
 
 /**
  * Attach a mark price to every funding event: the close of the latest mark
  * kline at or before the funding timestamp (falls back to execution klines).
  */
-function joinMarkPrice(
-  funding: { fundingTime: number; rate: number }[],
-  mark: RawKline[],
-  last: RawKline[],
-): FundingEvent[] {
-  const series = mark.length > 0 ? mark : last;
+export function joinMarkPrice(funding: FundingSeries, mark: KlineSeries, last: KlineSeries): FundingJoined {
+  const series = mark.t.length > 0 ? mark : last;
+  const len = series.t.length;
+  const markPrice = new Float64Array(funding.t.length);
   let j = 0;
-  return funding.map((f) => {
-    while (j + 1 < series.length && series[j + 1].openTime <= f.fundingTime) j += 1;
-    const bar = series[j];
-    const price =
-      bar && bar.openTime <= f.fundingTime
-        ? bar.close
-        : (series[0]?.close ?? 0);
-    return { t: f.fundingTime, rate: f.rate, markPrice: price };
-  });
+  for (let i = 0; i < funding.t.length; i++) {
+    const ft = funding.t[i];
+    while (j + 1 < len && series.t[j + 1] <= ft) j += 1;
+    // Before the first bar the first close is used; with no bars at all the price is 0.
+    markPrice[i] = len === 0 ? 0 : series.t[j] <= ft ? series.c[j] : series.c[0];
+  }
+  return { t: funding.t, rate: funding.rate, markPrice };
 }
-
 
 export async function startIngest(opts: {
   symbol: string; // 'ALL' or one of SYMBOLS
@@ -264,10 +194,11 @@ async function runJob(
         'last',
         archiveEvents(job, 'klines'),
       );
-      if (last.length < 50) {
-        throw new Error(`${symbol}: only ${last.length} klines received from the archive`);
+      if (last.t.length < 50) {
+        throw new Error(`${symbol}: only ${last.t.length} klines received from the archive`);
       }
       job.progress = base + step;
+      if (process.env.NPRS_DIAG === '1') console.log(`[diag] ${symbol} klines fetched: ${last.t.length} rows; ${memNote()}`);
 
       // --- 2. mark price klines (liquidation series) -----------------------
       job.current = `${symbol}: fetching ${opts.interval} mark price klines`;
@@ -280,10 +211,11 @@ async function runJob(
         'mark',
         archiveEvents(job, 'mark'),
       );
-      if (mark.length === 0) {
+      if (mark.t.length === 0) {
         logLine(job, `${symbol}: no mark klines available - liquidation will fall back to last price`);
       }
       job.progress = base + 2 * step;
+      if (process.env.NPRS_DIAG === '1') console.log(`[diag] ${symbol} mark klines fetched: ${mark.t.length} rows; ${memNote()}`);
 
       // --- 3. funding history (real settled rates) -------------------------
       // The archive publishes funding monthly only, so coverage ends with the
@@ -301,21 +233,19 @@ async function runJob(
       job.progress = base + 3 * step;
 
       // --- 4. persist atomically -------------------------------------------
-      job.current = `${symbol}: storing ${last.length} + ${mark.length} candles, ${funding.length} funding`;
-      await replaceDataset(
-        symbol,
-        opts.interval,
-        last,
-        mark,
-        funding,
-      );
-      job.insertedCandles += last.length + mark.length;
-      job.insertedFunding += funding.length;
+      // Counts are read before the write: the writer takes ownership of the arrays.
+      const lastRows = last.t.length;
+      const markRows = mark.t.length;
+      const fundingRows = funding.t.length;
+      job.current = `${symbol}: storing ${lastRows} + ${markRows} candles, ${fundingRows} funding`;
+      await replaceDataset(symbol, opts.interval, last, mark, funding);
+      job.insertedCandles += lastRows + markRows;
+      job.insertedFunding += fundingRows;
       job.progress = base + 3 * step;
 
       logLine(
         job,
-        `${symbol}: stored ${last.length} klines + ${mark.length} mark klines + ${funding.length} funding events`,
+        `${symbol}: stored ${lastRows} klines + ${markRows} mark klines + ${fundingRows} funding events`,
       );
     } catch (e) {
       failures.push(symbol);

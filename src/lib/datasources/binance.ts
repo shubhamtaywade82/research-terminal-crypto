@@ -30,9 +30,19 @@
 
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { FundingRow, Interval, RawKline } from '@/lib/nprs/types';
+import { Interval } from '@/lib/nprs/types';
 import { archiveGate, spotGate } from '@/lib/net/hosts';
-import { csvBytes, yieldToEventLoop } from './zip';
+import { yieldToEventLoop } from './event-loop';
+import {
+  decodeFundingZip,
+  decodeKlinesZip,
+  FUNDING_FIELDS,
+  FundingSeries,
+  klineGapDays,
+  KLINE_FIELDS,
+  KlineSeries,
+  mergeSeries,
+} from './decode-pool';
 import { RateLimitError, RequestBudget } from '@/lib/net/throttle';
 
 const ARCHIVE_HOST = 'https://data.binance.vision';
@@ -89,9 +99,9 @@ export class ArchiveNotFound extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level zip + CSV helpers
+// Archive files: disk cache and download. Decoding happens in the worker
+// (decode-pool.ts), never on the request thread.
 // ---------------------------------------------------------------------------
-
 
 /** Where a given archive path lives in the local cache (exists or not). */
 export function archiveCachePath(archivePath: string): string {
@@ -99,27 +109,22 @@ export function archiveCachePath(archivePath: string): string {
 }
 
 /**
- * Raw archive zip bytes: disk-cached, with retries on transport errors. A cached
- * copy that no longer unzips is treated as missing and downloaded again.
+ * Raw archive zip bytes: disk-cached, with retries on transport errors. The bytes are not
+ * unzipped here; a caller whose decode fails re-fetches with `force: true`.
  */
 export async function fetchArchiveZip(
   archivePath: string,
-  opts: { validateCache?: boolean; force?: boolean; budget?: RequestBudget } = {},
+  opts: { force?: boolean; budget?: RequestBudget } = {},
 ): Promise<{ buf: Buffer; cached: boolean }> {
   const url = `${ARCHIVE_HOST}${archivePath}`;
   const cachePath = path.join(CACHE_ROOT, archivePath.replace(/^\/+/, ''));
-  const validateCache = opts.validateCache ?? true;
 
-  // 1. disk cache. By default it is unzip-validated so a corrupt copy self-heals;
-  //    callers that unzip the bytes themselves pass validateCache: false and
-  //    re-fetch with force: true if their own unzip fails.
+  // 1. disk cache
   if (!opts.force) {
     try {
-      const cached = await readFile(cachePath);
-      if (validateCache) csvBytes(new Uint8Array(cached));
-      return { buf: cached, cached: true };
+      return { buf: await readFile(cachePath), cached: true };
     } catch {
-      // not cached (or corrupt) - fall through to download
+      // not cached - fall through to download
     }
   }
 
@@ -137,89 +142,42 @@ export async function fetchArchiveZip(
   }
   if (!res.ok) throw new Error(`HTTP ${res.status} from data.binance.vision`);
   const buf = Buffer.from(await res.arrayBuffer());
-  csvBytes(new Uint8Array(buf)); // validate before caching
   await mkdir(path.dirname(cachePath), { recursive: true });
   await writeFile(cachePath, buf);
   return { buf, cached: false };
 }
 
 /**
- * CSV text of one archive zip, disk-cached. The decode itself validates the bytes: a
- * cached copy that no longer decodes is re-fetched once, so the file is inflated once.
+ * Klines file (monthly or daily): bytes from the disk cache or the network, decoded in the
+ * worker. A cached copy that no longer decodes is re-fetched once.
  */
-async function fetchArchiveCsv(archivePath: string): Promise<{ text: string; cached: boolean }> {
-  const first = await fetchArchiveZip(archivePath, { validateCache: false });
+async function loadKlinesFile(
+  archivePath: string,
+  startMs: number,
+  endMs: number,
+): Promise<{ series: KlineSeries; cached: boolean }> {
+  const first = await fetchArchiveZip(archivePath);
   try {
-    return { text: new TextDecoder().decode(csvBytes(new Uint8Array(first.buf))), cached: first.cached };
+    return { series: await decodeKlinesZip(first.buf, startMs, endMs), cached: first.cached };
   } catch {
     const again = await fetchArchiveZip(archivePath, { force: true });
-    return { text: new TextDecoder().decode(csvBytes(new Uint8Array(again.buf))), cached: false };
+    return { series: await decodeKlinesZip(again.buf, startMs, endMs), cached: false };
   }
 }
 
-function parseKlinesCsv(
-  text: string,
+/** Funding file (monthly): same cache and re-fetch rule as klines. */
+async function loadFundingFile(
+  archivePath: string,
   startMs: number,
   endMs: number,
-  out: Map<number, RawKline>,
-): number {
-  const lines = text.split('\n');
-  let n = 0;
-  for (let li = 0; li < lines.length; li++) {
-    const line = lines[li].trim();
-    if (!line) continue;
-    if (li === 0 && line.startsWith('open_time')) continue; // header
-    const f = line.split(',');
-    const t = Number(f[0]);
-    if (!Number.isFinite(t) || t < startMs || t > endMs) continue;
-    const open = Number(f[1]);
-    const high = Number(f[2]);
-    const low = Number(f[3]);
-    const close = Number(f[4]);
-    const volume = Number(f[5]);
-    if (
-      !Number.isFinite(open) ||
-      !Number.isFinite(high) ||
-      !Number.isFinite(low) ||
-      !Number.isFinite(close)
-    ) {
-      continue;
-    }
-    out.set(t, { openTime: t, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 });
-    n += 1;
+): Promise<{ series: FundingSeries; cached: boolean }> {
+  const first = await fetchArchiveZip(archivePath);
+  try {
+    return { series: await decodeFundingZip(first.buf, startMs, endMs), cached: first.cached };
+  } catch {
+    const again = await fetchArchiveZip(archivePath, { force: true });
+    return { series: await decodeFundingZip(again.buf, startMs, endMs), cached: false };
   }
-  return n;
-}
-
-/**
- * Funding CSV: `calc_time[,funding_interval_hours],last_funding_rate`.
- * calc_time carries a small +ms offset on some rows; normalized to the UTC
- * hour boundary. Rate is the last field so both the old 2-column and the
- * current 3-column layouts parse identically.
- */
-function parseFundingCsv(
-  text: string,
-  startMs: number,
-  endMs: number,
-  out: Map<number, FundingRow>,
-): number {
-  const lines = text.split('\n');
-  let n = 0;
-  for (let li = 0; li < lines.length; li++) {
-    const line = lines[li].trim();
-    if (!line) continue;
-    if (li === 0 && line.startsWith('calc_time')) continue; // header
-    const f = line.split(',');
-    const raw = Number(f[0]);
-    if (!Number.isFinite(raw)) continue;
-    const rate = Number(f[f.length - 1]);
-    if (!Number.isFinite(rate)) continue;
-    const t = Math.floor(raw / HOUR_MS) * HOUR_MS;
-    if (t < startMs || t > endMs) continue;
-    out.set(t, { fundingTime: t, rate, markPrice: 0 }); // mark joined by the ingest from mark klines
-    n += 1;
-  }
-  return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,23 +287,6 @@ function archiveTasks(
   return tasks;
 }
 
-/**
- * Missing bar timestamps strictly between the first and last stored bar
- * (never outside - pre-listing ranges would just 404). Grouped by UTC day so
- * each hole costs at most one daily zip.
- */
-function detectGapDays(merged: Map<number, RawKline>, stepMs: number): Set<number> {
-  if (merged.size < 2) return new Set();
-  const days = new Set<number>();
-  const stamps = Array.from(merged.keys()).sort((a, b) => a - b);
-  const first = stamps[0];
-  const last = stamps[stamps.length - 1];
-  for (let t = first + stepMs; t < last; t += stepMs) {
-    if (!merged.has(t)) days.add(utcDayStart(t).getTime());
-  }
-  return days;
-}
-
 /** Bounded-concurrency map preserving input order. */
 async function pMap<T, R>(
   items: T[],
@@ -392,18 +333,18 @@ export async function fetchFuturesKlines(
   endMs: number,
   kind: 'last' | 'mark' = 'last',
   events?: ArchiveEvents,
-): Promise<RawKline[]> {
+): Promise<KlineSeries> {
   assertArchiveArgs(symbol, interval);
   const tasks = klineTasks(symbol, interval, kind, startMs, endMs, Date.now());
-  const merged = new Map<number, RawKline>();
+  const slots = new Array<KlineSeries | undefined>(tasks.length);
 
   await pMap(
     tasks,
-    async (task) => {
+    async (task, i) => {
       try {
-        const { text, cached } = await fetchArchiveCsv(task.archivePath);
-        const rows = parseKlinesCsv(text, startMs, endMs, merged);
-        events?.onFile?.(task.file, cached ? 'cached' : 'downloaded', rows);
+        const { series, cached } = await loadKlinesFile(task.archivePath, startMs, endMs);
+        slots[i] = series;
+        events?.onFile?.(task.file, cached ? 'cached' : 'downloaded', series.t.length);
         await yieldToEventLoop();
       } catch (e) {
         if (e instanceof ArchiveNotFound) {
@@ -416,39 +357,41 @@ export async function fetchFuturesKlines(
     DOWNLOAD_CONCURRENCY,
   );
 
-  // --- gap healing -----------------------------------------------------------
-  // Monthly zips occasionally miss whole days (observed: BTCUSDT 1h mark
-  // 2026-06-29 absent from the June monthly zip while the daily zip has it).
-  // Detect holes between the first and last bar and patch them from daily
-  // files, bounded by MAX_HEAL_DAYS per fetch.
+  // Task order, so the result does not depend on which download finished first.
+  let merged = await mergeSeries(
+    slots.filter((s): s is KlineSeries => s !== undefined),
+    KLINE_FIELDS,
+  );
+
+  // Monthly zips occasionally miss whole days (observed: BTCUSDT 1h mark 2026-06-29 absent from
+  // the June monthly zip while the daily zip has it). Holes between the first and last bar are
+  // patched from daily files, bounded by MAX_HEAL_DAYS per fetch.
   const stepMs = INTERVAL_STEP_MS[interval];
-  if (stepMs) {
-    const gapDays = detectGapDays(merged, stepMs);
-    if (gapDays.size > 0) {
+  if (stepMs && merged.t.length > 1) {
+    const gaps = await klineGapDays(merged, stepMs);
+    if (gaps.length > 0) {
       const family = kind === 'mark' ? 'markPriceKlines' : 'klines';
-      const days = Array.from(gapDays).sort((a, b) => a - b).slice(0, MAX_HEAL_DAYS);
-      if (gapDays.size > MAX_HEAL_DAYS) {
-        events?.onFile?.(
-          `${gapDays.size} gap days (heal cap ${MAX_HEAL_DAYS})`,
-          'missing',
-          0,
-        );
+      const days = Array.from(gaps).slice(0, MAX_HEAL_DAYS);
+      if (gaps.length > MAX_HEAL_DAYS) {
+        events?.onFile?.(`${gaps.length} gap days (heal cap ${MAX_HEAL_DAYS})`, 'missing', 0);
       }
+      const healed = new Array<KlineSeries | undefined>(days.length);
       await pMap(
         days,
-        async (day) => {
-          const ymd = ymdOf(new Date(day));
+        async (day, i) => {
+          const file = `${symbol}-${interval}-${ymdOf(new Date(day))}.zip`;
           try {
-            const { text } = await fetchArchiveCsv(
-              `/data/futures/um/daily/${family}/${symbol}/${interval}/${symbol}-${interval}-${ymd}.zip`,
+            const { series } = await loadKlinesFile(
+              `/data/futures/um/daily/${family}/${symbol}/${interval}/${file}`,
+              startMs,
+              endMs,
             );
-            const before = merged.size;
-            parseKlinesCsv(text, startMs, endMs, merged);
-            events?.onFile?.(`${symbol}-${interval}-${ymd}.zip`, 'healed', merged.size - before);
+            healed[i] = series;
+            events?.onFile?.(file, 'healed', series.t.length);
             await yieldToEventLoop();
           } catch (e) {
             if (e instanceof ArchiveNotFound) {
-              events?.onFile?.(`${symbol}-${interval}-${ymd}.zip`, 'missing', 0);
+              events?.onFile?.(file, 'missing', 0);
               return;
             }
             throw e;
@@ -456,10 +399,13 @@ export async function fetchFuturesKlines(
         },
         DOWNLOAD_CONCURRENCY,
       );
+      merged = await mergeSeries(
+        [merged, ...healed.filter((s): s is KlineSeries => s !== undefined)],
+        KLINE_FIELDS,
+      );
     }
   }
-
-  return Array.from(merged.values()).sort((a, b) => a.openTime - b.openTime);
+  return merged;
 }
 
 /** Real USDT-M funding-rate history from Binance's official public archive. */
@@ -468,18 +414,18 @@ export async function fetchFundingHistory(
   startMs: number,
   endMs: number,
   events?: ArchiveEvents,
-): Promise<FundingRow[]> {
+): Promise<FundingSeries> {
   assertArchiveArgs(symbol);
   const tasks = fundingTasks(symbol, startMs, endMs, Date.now());
-  const merged = new Map<number, FundingRow>();
+  const slots = new Array<FundingSeries | undefined>(tasks.length);
 
   await pMap(
     tasks,
-    async (task) => {
+    async (task, i) => {
       try {
-        const { text, cached } = await fetchArchiveCsv(task.archivePath);
-        const rows = parseFundingCsv(text, startMs, endMs, merged);
-        events?.onFile?.(task.file, cached ? 'cached' : 'downloaded', rows);
+        const { series, cached } = await loadFundingFile(task.archivePath, startMs, endMs);
+        slots[i] = series;
+        events?.onFile?.(task.file, cached ? 'cached' : 'downloaded', series.t.length);
         await yieldToEventLoop();
       } catch (e) {
         if (e instanceof ArchiveNotFound) {
@@ -491,8 +437,10 @@ export async function fetchFundingHistory(
     },
     DOWNLOAD_CONCURRENCY,
   );
-
-  return Array.from(merged.values()).sort((a, b) => a.fundingTime - b.fundingTime);
+  return mergeSeries(
+    slots.filter((s): s is FundingSeries => s !== undefined),
+    FUNDING_FIELDS,
+  );
 }
 
 // --- Live spot REST (real Binance API, used for the market pulse strip) -----

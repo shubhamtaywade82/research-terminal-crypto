@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { strToU8, zipSync } from 'fflate';
 import { RateLimitError, RequestBudget, RequestBudgetExceeded } from '@/lib/net/throttle';
+import { stopDecodeWorker } from '@/lib/datasources/decode-pool';
 
 // Module-level cache root and gates: set up before the modules load.
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nprs-limits-'));
@@ -22,6 +23,8 @@ function dayZip(dayStart: number): Uint8Array {
   const csv = `agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker\n1,100,1,1,1,${dayStart + 1000},true\n`;
   return zipSync({ 'day.csv': strToU8(csv) });
 }
+
+afterAll(() => stopDecodeWorker());
 
 let fetchCalls: string[] = [];
 beforeEach(() => {
